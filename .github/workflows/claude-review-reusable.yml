@@ -1,0 +1,44 @@
+name: Claude Code Review (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Every repo's caller triggers on pull_request and delegates here, so the
+# review logic (model, plugin, prompt, gates) is edited in ONE place.
+#
+# Auth: CLAUDE_CODE_OAUTH_TOKEN — uses the existing Claude subscription, so
+# reviews cost nothing per run but share that one account's rate limits. If
+# whole-team volume starts hitting the wall, switch the single `with:` line
+# below to `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}` (pay-as-you-go,
+# no wall) and add that org secret — callers never change.
+
+on:
+  workflow_call: {}
+
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    if: |
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
