@@ -22,7 +22,11 @@ jobs:
     if: |
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: self-hosted
+    # Private repos use the org self-hosted runner (free minutes); public repos
+    # (e.g. nucleus) fall back to GitHub-hosted, because the org runner group sets
+    # allows_public_repositories=false so self-hosted jobs from public repos queue
+    # forever. Keeps the "weblime-ci = private only" rule intact.
+    runs-on: ${{ github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
     permissions:
       contents: read
       pull-requests: write
