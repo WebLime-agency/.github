@@ -11,7 +11,10 @@ name: Claude Code Review (reusable)
 # no wall) and add that org secret — callers never change.
 
 on:
-  workflow_call: {}
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
 
 concurrency:
   group: claude-code-review-${{ github.event.pull_request.number }}
