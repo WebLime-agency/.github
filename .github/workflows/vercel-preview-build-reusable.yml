@@ -1,0 +1,87 @@
+name: Vercel Preview Build (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Per-repo callers own the pull_request trigger; this keeps the tokenless
+# preview build logic in one place while preserving repo-specific variables.
+
+on:
+  workflow_call:
+    inputs:
+      preview_base_branch:
+        description: "Branch the caller should trigger preview builds against."
+        required: false
+        type: string
+        default: dev
+      node_version_file:
+        description: "Path to the Node.js version file."
+        required: false
+        type: string
+        default: .node-version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vercel-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-preview:
+    name: Build Vercel preview output
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
+    env:
+      PUBLIC_SUPABASE_URL: ${{ vars.PUBLIC_SUPABASE_URL }}
+      PUBLIC_SUPABASE_ANON_KEY: ${{ vars.PUBLIC_SUPABASE_ANON_KEY }}
+      PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ inputs.node_version_file }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Vercel output
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run build
+
+      - name: Verify Vercel output
+        run: |
+          set -euo pipefail
+
+          test -d .vercel/output
+          test -f .vercel/output/config.json
+
+          if ! find .vercel/output -mindepth 1 -maxdepth 1 | grep -q .; then
+            echo ".vercel/output is empty."
+            exit 1
+          fi
+
+      - name: Write PR number
+        run: printf '%s\n' '${{ github.event.pull_request.number }}' > pr-number.txt
+
+      - name: Package Vercel output
+        run: |
+          set -euo pipefail
+
+          tar -czf vercel-preview-output.tar.gz .vercel/output
+          tar -tzf vercel-preview-output.tar.gz > vercel-preview-output-contents.txt
+          grep -Fxq '.vercel/output/config.json' vercel-preview-output-contents.txt
+
+      - name: Upload Vercel output
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-preview-output
+          path: |
+            vercel-preview-output.tar.gz
+            pr-number.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
