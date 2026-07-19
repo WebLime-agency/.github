@@ -29,10 +29,6 @@ jobs:
   build-preview:
     name: Build Vercel preview output
     runs-on: [self-hosted, Linux, X64, weblime-ci]
-    env:
-      PUBLIC_SUPABASE_URL: ${{ vars.PUBLIC_SUPABASE_URL }}
-      PUBLIC_SUPABASE_ANON_KEY: ${{ vars.PUBLIC_SUPABASE_ANON_KEY }}
-      PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
@@ -46,6 +42,23 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Inject repo/org Variables into build env
+        env:
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          # Repo-agnostic: export every repository/organization Variable (non-secret
+          # config, including each repo's own PUBLIC_* build vars) into the build
+          # environment. Secrets are NOT part of the `vars` context, so the build
+          # stays tokenless. Values are read from an env var (never interpolated into
+          # the shell) and single-line config values are expected.
+          node -e '
+            const fs = require("fs");
+            const vars = JSON.parse(process.env.VARS_JSON || "{}");
+            const lines = Object.entries(vars).map(([k, v]) => `${k}=${v}`);
+            if (lines.length) fs.appendFileSync(process.env.GITHUB_ENV, lines.join("\n") + "\n");
+          '
 
       - name: Build Vercel output
         env:
