@@ -1,0 +1,65 @@
+name: Vercel Production Deploy (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Per-repo callers own the push trigger; this keeps the trusted production
+# deploy logic in one place while preserving repo-specific variables.
+
+on:
+  workflow_call:
+    inputs:
+      production_branch:
+        description: "Branch the caller should trigger production deploys from."
+        required: false
+        type: string
+        default: main
+      node_version_file:
+        description: "Path to the Node.js version file."
+        required: false
+        type: string
+        default: .node-version
+      vercel_cli_version:
+        description: "Pinned Vercel CLI version to install."
+        required: false
+        type: string
+        default: 56.3.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vercel-production-${{ inputs.production_branch }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-production:
+    name: Deploy production to Vercel
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
+    environment: production
+    steps:
+      - name: Install Vercel CLI
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+        run: npm install -g vercel@${{ inputs.vercel_cli_version }} --ignore-scripts
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ inputs.node_version_file }}
+
+      - name: Pull Vercel production environment
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build Vercel production
+        run: vercel build --prod
+
+      - name: Deploy Vercel production
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
