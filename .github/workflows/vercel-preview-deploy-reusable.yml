@@ -1,0 +1,101 @@
+name: Vercel Preview Deploy (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Contract: the stage-2 caller must trigger on workflow_run for the stage-1
+# caller's workflow name. The fleet callers use "Vercel Preview Build".
+
+on:
+  workflow_call:
+    inputs:
+      vercel_cli_version:
+        description: "Pinned Vercel CLI version to install."
+        required: false
+        type: string
+        default: 56.3.1
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: vercel-preview-deploy-${{ github.event.workflow_run.pull_requests[0].number }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-preview:
+    name: Deploy Vercel preview output
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
+    environment: vercel-preview
+    env:
+      VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Install Vercel CLI
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+        run: npm install -g vercel@${{ inputs.vercel_cli_version }} --ignore-scripts
+
+      - name: Download Vercel output
+        uses: actions/download-artifact@v4
+        with:
+          name: vercel-preview-output
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Vercel output
+        run: |
+          set -euo pipefail
+
+          test -f vercel-preview-output.tar.gz
+          tar -xzf vercel-preview-output.tar.gz
+          test -d .vercel/output
+          test -f .vercel/output/config.json
+
+      - name: Read PR number
+        id: pr
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="$(tr -d '[:space:]' < pr-number.txt)"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "pr-number.txt did not contain a PR number."
+            exit 1
+          fi
+
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Vercel preview
+        id: deploy
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          test -d .vercel/output
+          test -f .vercel/output/config.json
+
+          DEPLOY_OUTPUT="$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")"
+          printf '%s\n' "$DEPLOY_OUTPUT"
+
+          DEPLOYMENT_URL="$(printf '%s\n' "$DEPLOY_OUTPUT" | grep -Eo 'https://[^[:space:]]+\.vercel\.app[^[:space:]]*' | tail -n 1 || true)"
+          if [ -z "$DEPLOYMENT_URL" ]; then
+            echo "Unable to find a Vercel deployment URL in deploy output."
+            exit 1
+          fi
+
+          echo "deployment_url=$DEPLOYMENT_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Comment preview URL
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          number: ${{ steps.pr.outputs.number }}
+          header: vercel-preview
+          message: |
+            ## Vercel Preview
+
+            Preview deployment: ${{ steps.deploy.outputs.deployment_url }}
+
+            This deployment is created by GitHub Actions from a prebuilt artifact. PR code never runs in a job that has the Vercel token.
