@@ -1,0 +1,86 @@
+name: Supabase Migrate
+description: Apply Supabase migrations from a resolved deploy ref before promoting code.
+
+inputs:
+  access-token:
+    description: Supabase access token used by the CLI.
+    required: true
+  db-password:
+    description: Production database password for the target Supabase project.
+    required: true
+  project-id:
+    description: Supabase project ref to link before applying migrations.
+    required: true
+  deploy-ref:
+    description: Git ref or SHA containing the migrations being promoted.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Supabase CLI
+      uses: supabase/setup-cli@v1
+      with:
+        version: 2.75.0
+
+    - name: Prepare deployable schema worktree
+      id: schema_worktree
+      shell: bash
+      env:
+        DEPLOY_REF: ${{ inputs.deploy-ref }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$DEPLOY_REF" ]; then
+          echo "::error title=Missing action input::deploy-ref is required to prepare the production Supabase migration worktree."
+          exit 1
+        fi
+
+        SCHEMA_WORKTREE="${RUNNER_TEMP}/supabase-migrate-schema-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        git worktree add --detach "$SCHEMA_WORKTREE" "$DEPLOY_REF"
+        echo "Prepared schema worktree at $SCHEMA_WORKTREE"
+        echo "path=$SCHEMA_WORKTREE" >> "$GITHUB_OUTPUT"
+
+    - name: Apply production database migrations
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        SUPABASE_DB_PASSWORD: ${{ inputs.db-password }}
+        SUPABASE_PROJECT_ID: ${{ inputs.project-id }}
+      working-directory: ${{ steps.schema_worktree.outputs.path }}
+      run: |
+        set -euo pipefail
+
+        missing_input=false
+        for input_name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD SUPABASE_PROJECT_ID; do
+          if [ -z "${!input_name:-}" ]; then
+            echo "::error title=Missing action input::${input_name} is required to apply production Supabase migrations before promoting main."
+            missing_input=true
+          fi
+        done
+
+        if [ "$missing_input" = "true" ]; then
+          exit 1
+        fi
+
+        supabase link \
+          --project-ref "$SUPABASE_PROJECT_ID" \
+          --password "$SUPABASE_DB_PASSWORD" \
+          --yes
+
+        echo "Production migration status before push:"
+        supabase migration list --password "$SUPABASE_DB_PASSWORD"
+
+        # Keep this before the caller moves its production branch. Supabase
+        # migrations must follow expand-then-contract discipline: schema-ahead is
+        # tolerated by old code, while code-ahead-of-schema can break production.
+        # set -e halts the caller before deploy if link/list/push fails.
+        supabase db push \
+          --password "$SUPABASE_DB_PASSWORD" \
+          --yes
+
+    - name: Clean up schema worktree
+      if: always() && steps.schema_worktree.outputs.path != ''
+      shell: bash
+      run: |
+        git worktree remove --force "${{ steps.schema_worktree.outputs.path }}" || true
