@@ -97,4 +97,4 @@ jobs:
             pr-number.txt
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
