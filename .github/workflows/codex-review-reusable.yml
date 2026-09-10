@@ -1,0 +1,211 @@
+name: Codex Review (reusable)
+
+# Central reusable workflow - lives in WebLime-agency/.github.
+# Every repo's caller triggers on issue_comment and delegates here, so the
+# @codex review logic (auth, prompt, CLI pin, failure reporting) is edited in
+# ONE place.
+#
+# Auth: CODEX_AUTH - a shared Codex/ChatGPT account auth.json stored as an org
+# secret by an admin. The workflow reads it into ~/.codex/auth.json for codex
+# exec and fails loudly if setup or review execution breaks.
+
+on:
+  workflow_call:
+    secrets:
+      CODEX_AUTH:
+        required: true
+
+concurrency:
+  group: codex-review-${{ github.event.issue.number }}-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # Only trusted authors (org owners/members and repo collaborators) can trigger
+    # a run. This prevents anonymous public users from draining the shared Codex
+    # account or attempting prompt-injection via @codex review on public repos.
+    # NOTE: keep each OR-clause on ONE line - GitHub's if-expression parser is
+    # reliable that way; explicit == comparisons avoid fromJSON edge cases.
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@codex review') &&
+      (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'COLLABORATOR')
+    # Private repos run on our own self-hosted runners (no GitHub minutes); public
+    # repos stay on GitHub-hosted where gh is preinstalled and public minutes are free.
+    runs-on: ${{ github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      CODEX_CLI_PACKAGE: '@openai/codex@0.154.0'
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Acknowledge review request
+        run: |
+          if ! gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes >/dev/null; then
+            echo "Could not add eyes reaction to the trigger comment; continuing."
+          fi
+
+      - name: Check out PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/pull/${{ github.event.issue.number }}/merge
+
+      - name: Install pinned Codex CLI
+        run: npx -y "$CODEX_CLI_PACKAGE" --version
+
+      - name: Configure shared Codex auth
+        id: codex_auth
+        continue-on-error: true
+        env:
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+        run: |
+          if [ -z "$CODEX_AUTH" ]; then
+            echo "CODEX_AUTH is not configured or is empty."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+          jq empty "$HOME/.codex/auth.json"
+
+      - name: Report auth setup failure
+        if: steps.codex_auth.outcome == 'failure'
+        run: |
+          body_file="$RUNNER_TEMP/codex-review-auth-failed.md"
+          {
+            echo "## Codex Review Failed"
+            echo
+            echo "The shared Codex authentication setup failed before the review could run."
+            echo
+            echo "Action run: $RUN_URL"
+          } > "$body_file"
+
+          gh pr comment "$PR_NUMBER" --body-file "$body_file"
+          exit 1
+
+      - name: Build review prompt
+        if: steps.codex_auth.outcome == 'success'
+        run: |
+          pr_json="$RUNNER_TEMP/pr.json"
+          diff_file="$RUNNER_TEMP/pr.diff"
+          prompt_file="$RUNNER_TEMP/codex-review-prompt.md"
+
+          gh pr view "$PR_NUMBER" \
+            --json number,title,url,author,baseRefName,headRefName \
+            > "$pr_json"
+
+          gh pr diff "$PR_NUMBER" --patch > "$diff_file"
+
+          if [ ! -s "$diff_file" ]; then
+            echo "PR diff is empty."
+            exit 1
+          fi
+
+          {
+            cat <<'PROMPT'
+          You are reviewing a GitHub pull request.
+
+          Review only the diff provided below. Prioritize correctness bugs, security issues,
+          data-loss risks, broken CI/deploy behavior, and missing tests for risky behavior.
+          Be concise. If you find issues, list them first with severity and file/path context.
+          If you do not find any major issues, say exactly:
+
+          Didn't find any major issues.
+          PROMPT
+            echo
+            echo "Pull request metadata:"
+            jq -r '"- Number: #\(.number)\n- Title: \(.title)\n- URL: \(.url)\n- Author: \(.author.login)\n- Base: \(.baseRefName)\n- Head: \(.headRefName)"' "$pr_json"
+            echo
+            echo "Diff:"
+            echo '```diff'
+            cat "$diff_file"
+            echo '```'
+          } > "$prompt_file"
+
+          byte_count=$(wc -c < "$diff_file")
+          echo "Prepared review prompt from PR #$PR_NUMBER diff ($byte_count bytes)."
+
+      - name: Run Codex review
+        id: codex_review
+        if: steps.codex_auth.outcome == 'success'
+        continue-on-error: true
+        run: |
+          review_file="$RUNNER_TEMP/codex-review.md"
+          log_file="$RUNNER_TEMP/codex-review.log"
+          prompt_file="$RUNNER_TEMP/codex-review-prompt.md"
+
+          npx -y "$CODEX_CLI_PACKAGE" exec \
+            --sandbox read-only \
+            --ignore-user-config \
+            --ignore-rules \
+            --ephemeral \
+            --color never \
+            --output-last-message "$review_file" \
+            - < "$prompt_file" > "$log_file" 2>&1
+          status=$?
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          if [ "$status" -ne 0 ]; then
+            echo "codex exec failed with exit code $status."
+            sed \
+              -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+              -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
+              -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+              "$log_file" | tail -n 120
+            exit "$status"
+          fi
+
+          if [ ! -s "$review_file" ]; then
+            echo "codex exec completed without producing review output."
+            sed \
+              -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+              -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
+              -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+              "$log_file" | tail -n 120
+            exit 1
+          fi
+
+      - name: Report Codex review failure
+        if: steps.codex_review.outcome == 'failure'
+        run: |
+          body_file="$RUNNER_TEMP/codex-review-failed.md"
+          {
+            echo "## Codex Review Failed"
+            echo
+            echo "The self-hosted Codex review command failed instead of posting a review."
+            echo
+            echo "- Exit code: ${{ steps.codex_review.outputs.exit_code || 'unknown' }}"
+            echo "- Action run: $RUN_URL"
+          } > "$body_file"
+
+          gh pr comment "$PR_NUMBER" --body-file "$body_file"
+          exit 1
+
+      - name: Post Codex review
+        if: steps.codex_review.outcome == 'success'
+        run: |
+          review_file="$RUNNER_TEMP/codex-review.md"
+          body_file="$RUNNER_TEMP/codex-review-comment.md"
+
+          {
+            echo "## Codex Review"
+            echo
+            cat "$review_file"
+          } > "$body_file"
+
+          gh pr comment "$PR_NUMBER" --body-file "$body_file"
