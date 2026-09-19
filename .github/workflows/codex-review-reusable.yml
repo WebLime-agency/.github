@@ -98,20 +98,97 @@ jobs:
           exit 1
 
       - name: Build review prompt
+        id: review_prepare
         if: steps.codex_auth.outcome == 'success'
+        continue-on-error: true
         run: |
           pr_json="$RUNNER_TEMP/pr.json"
           diff_file="$RUNNER_TEMP/pr.diff"
+          manifest_file="$RUNNER_TEMP/pr.name-status"
           prompt_file="$RUNNER_TEMP/codex-review-prompt.md"
+          prep_log="$RUNNER_TEMP/codex-review-prepare.log"
+          prompt_limit=1048576
 
-          gh pr view "$PR_NUMBER" \
-            --json number,title,url,author,baseRefName,headRefName \
-            > "$pr_json"
+          : > "$prep_log"
+          exec > >(tee -a "$prep_log") 2>&1
 
-          gh pr diff "$PR_NUMBER" --patch > "$diff_file"
+          export LC_ALL=C.UTF-8
+          export LANG=C.UTF-8
+
+          echo "Capturing PR metadata for $REPO#$PR_NUMBER."
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$pr_json"
+
+          pr_title=$(jq -r '.title // empty' "$pr_json")
+          pr_url=$(jq -r '.html_url // empty' "$pr_json")
+          pr_author=$(jq -r '.user.login // empty' "$pr_json")
+          base_ref=$(jq -r '.base.ref // empty' "$pr_json")
+          head_ref=$(jq -r '.head.ref // empty' "$pr_json")
+          base_sha=$(jq -r '.base.sha // empty' "$pr_json")
+          head_sha=$(jq -r '.head.sha // empty' "$pr_json")
+
+          for field_name in pr_title pr_url pr_author base_ref head_ref base_sha head_sha; do
+            if [ -z "${!field_name}" ] || [ "${!field_name}" = "null" ]; then
+              echo "PR metadata field '$field_name' is missing; cannot prepare a revision-bound review."
+              exit 1
+            fi
+          done
+
+          echo "Captured base $base_ref@$base_sha and head $head_ref@$head_sha."
+
+          if ! git cat-file -e "$base_sha^{commit}"; then
+            echo "Captured base commit is not available in the checkout: $base_sha"
+            exit 1
+          fi
+
+          if ! git cat-file -e "$head_sha^{commit}"; then
+            echo "Captured head commit is not available in the checkout: $head_sha"
+            exit 1
+          fi
+
+          if ! actual_base_parent=$(git rev-parse --verify HEAD^1 2>/dev/null); then
+            echo "Checked-out PR ref is not a merge commit with a base parent."
+            exit 1
+          fi
+
+          if ! actual_head_parent=$(git rev-parse --verify HEAD^2 2>/dev/null); then
+            echo "Checked-out PR ref is not a merge commit with a head parent."
+            exit 1
+          fi
+
+          if [ "$actual_base_parent" != "$base_sha" ]; then
+            echo "Checked-out merge base parent does not match captured PR base."
+            echo "Expected base parent: $base_sha"
+            echo "Actual base parent:   $actual_base_parent"
+            exit 1
+          fi
+
+          if [ "$actual_head_parent" != "$head_sha" ]; then
+            echo "Checked-out merge head parent does not match captured PR head."
+            echo "Expected head parent: $head_sha"
+            echo "Actual head parent:   $actual_head_parent"
+            exit 1
+          fi
+
+          if ! merge_base=$(git merge-base "$base_sha" "$head_sha"); then
+            echo "Could not compute merge base for captured revisions."
+            echo "Base: $base_sha"
+            echo "Head: $head_sha"
+            exit 1
+          fi
+
+          git diff --find-renames "$merge_base" "$head_sha" -- > "$diff_file"
+          git diff --find-renames --name-status "$merge_base" "$head_sha" -- > "$manifest_file"
 
           if [ ! -s "$diff_file" ]; then
-            echo "PR diff is empty."
+            echo "Cumulative PR diff is empty for captured revisions."
+            echo "Base: $base_sha"
+            echo "Head: $head_sha"
+            echo "Merge base: $merge_base"
+            exit 1
+          fi
+
+          if [ ! -s "$manifest_file" ]; then
+            echo "Changed-file manifest is empty for a nonempty diff; refusing to prepare an ambiguous review."
             exit 1
           fi
 
@@ -128,7 +205,18 @@ jobs:
           PROMPT
             echo
             echo "Pull request metadata:"
-            jq -r '"- Number: #\(.number)\n- Title: \(.title)\n- URL: \(.url)\n- Author: \(.author.login)\n- Base: \(.baseRefName)\n- Head: \(.headRefName)"' "$pr_json"
+            printf -- '- Number: #%s\n' "$PR_NUMBER"
+            printf -- '- Title: %s\n' "$pr_title"
+            printf -- '- URL: %s\n' "$pr_url"
+            printf -- '- Author: %s\n' "$pr_author"
+            printf -- '- Reviewed base: %s @ %s\n' "$base_ref" "$base_sha"
+            printf -- '- Reviewed head: %s @ %s\n' "$head_ref" "$head_sha"
+            printf -- '- Merge base: %s\n' "$merge_base"
+            echo
+            echo "Changed-file manifest:"
+            echo '```'
+            cat "$manifest_file"
+            echo '```'
             echo
             echo "Diff:"
             echo '```diff'
@@ -136,18 +224,73 @@ jobs:
             echo '```'
           } > "$prompt_file"
 
-          byte_count=$(wc -c < "$diff_file")
-          echo "Prepared review prompt from PR #$PR_NUMBER diff ($byte_count bytes)."
+          prompt_chars=$(wc -m < "$prompt_file" | tr -d '[:space:]')
+          diff_chars=$(wc -m < "$diff_file" | tr -d '[:space:]')
+          echo "Prompt Unicode characters: $prompt_chars/$prompt_limit."
+          echo "Cumulative diff Unicode characters: $diff_chars."
+
+          if [ "$prompt_chars" -gt "$prompt_limit" ]; then
+            echo "Prepared prompt exceeds Codex CLI user-input limit."
+            echo "Prompt Unicode characters: $prompt_chars"
+            echo "Maximum Unicode characters: $prompt_limit"
+            exit 1
+          fi
+
+          {
+            echo "base_ref=$base_ref"
+            echo "head_ref=$head_ref"
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+            echo "merge_base=$merge_base"
+            echo "prompt_chars=$prompt_chars"
+            echo "prompt_limit=$prompt_limit"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Prepared review prompt from cumulative PR #$PR_NUMBER diff."
+
+      - name: Report Codex review preparation failure
+        if: steps.review_prepare.outcome == 'failure'
+        run: |
+          body_file="$RUNNER_TEMP/codex-review-prepare-failed.md"
+          prep_log="$RUNNER_TEMP/codex-review-prepare.log"
+
+          {
+            echo "## Codex Review Failed"
+            echo
+            echo "The Codex review input could not be prepared safely, so no review was run."
+            echo
+            echo "- Action run: $RUN_URL"
+            echo
+            if [ -s "$prep_log" ]; then
+              echo "Diagnostic tail:"
+              echo '```'
+              sed \
+                -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+                -e 's/Bearer [A-Za-z0-9._~+\/=-]*/Bearer [redacted]/g' \
+                -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
+                -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+                -e 's/refresh_token[^,}]*/refresh_token:[redacted]/g' \
+                -e 's/"auth"[^,}]*/"auth":"[redacted]"/g' \
+                "$prep_log" | tail -n 80
+              echo '```'
+            fi
+          } > "$body_file"
+
+          gh pr comment "$PR_NUMBER" --body-file "$body_file"
+          exit 1
 
       - name: Run Codex review
         id: codex_review
-        if: steps.codex_auth.outcome == 'success'
+        if: steps.codex_auth.outcome == 'success' && steps.review_prepare.outcome == 'success'
         continue-on-error: true
         run: |
           review_file="$RUNNER_TEMP/codex-review.md"
           log_file="$RUNNER_TEMP/codex-review.log"
           prompt_file="$RUNNER_TEMP/codex-review-prompt.md"
 
+          rm -f "$review_file" "$log_file"
+
+          set +e
           npx -y "$CODEX_CLI_PACKAGE" exec \
             --sandbox read-only \
             --ignore-user-config \
@@ -157,6 +300,7 @@ jobs:
             --output-last-message "$review_file" \
             - < "$prompt_file" > "$log_file" 2>&1
           status=$?
+          set -e
 
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
 
@@ -164,18 +308,24 @@ jobs:
             echo "codex exec failed with exit code $status."
             sed \
               -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+              -e 's/Bearer [A-Za-z0-9._~+\/=-]*/Bearer [redacted]/g' \
               -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
               -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+              -e 's/refresh_token[^,}]*/refresh_token:[redacted]/g' \
+              -e 's/"auth"[^,}]*/"auth":"[redacted]"/g' \
               "$log_file" | tail -n 120
             exit "$status"
           fi
 
-          if [ ! -s "$review_file" ]; then
-            echo "codex exec completed without producing review output."
+          if [ ! -s "$review_file" ] || ! grep -q '[^[:space:]]' "$review_file"; then
+            echo "codex exec completed without producing a nonempty final message."
             sed \
               -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+              -e 's/Bearer [A-Za-z0-9._~+\/=-]*/Bearer [redacted]/g' \
               -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
               -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+              -e 's/refresh_token[^,}]*/refresh_token:[redacted]/g' \
+              -e 's/"auth"[^,}]*/"auth":"[redacted]"/g' \
               "$log_file" | tail -n 120
             exit 1
           fi
@@ -184,13 +334,28 @@ jobs:
         if: steps.codex_review.outcome == 'failure'
         run: |
           body_file="$RUNNER_TEMP/codex-review-failed.md"
+          log_file="$RUNNER_TEMP/codex-review.log"
           {
             echo "## Codex Review Failed"
             echo
-            echo "The self-hosted Codex review command failed instead of posting a review."
+            echo "The self-hosted Codex review command failed or did not produce a nonempty final message."
             echo
             echo "- Exit code: ${{ steps.codex_review.outputs.exit_code || 'unknown' }}"
             echo "- Action run: $RUN_URL"
+            echo
+            if [ -s "$log_file" ]; then
+              echo "Diagnostic tail:"
+              echo '```'
+              sed \
+                -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
+                -e 's/Bearer [A-Za-z0-9._~+\/=-]*/Bearer [redacted]/g' \
+                -e 's/session_[A-Za-z0-9_-]*/[redacted-session]/g' \
+                -e 's/access_token[^,}]*/access_token:[redacted]/g' \
+                -e 's/refresh_token[^,}]*/refresh_token:[redacted]/g' \
+                -e 's/"auth"[^,}]*/"auth":"[redacted]"/g' \
+                "$log_file" | tail -n 80
+              echo '```'
+            fi
           } > "$body_file"
 
           gh pr comment "$PR_NUMBER" --body-file "$body_file"
@@ -201,11 +366,61 @@ jobs:
         run: |
           review_file="$RUNNER_TEMP/codex-review.md"
           body_file="$RUNNER_TEMP/codex-review-comment.md"
+          live_pr_json="$RUNNER_TEMP/pr-live.json"
+
+          if [ ! -s "$review_file" ] || ! grep -q '[^[:space:]]' "$review_file"; then
+            missing_body_file="$RUNNER_TEMP/codex-review-output-missing.md"
+            {
+              echo "## Codex Review Failed"
+              echo
+              echo "The Codex final message was missing or empty at post time, so no review verdict was posted."
+              echo
+              echo "- Action run: $RUN_URL"
+            } > "$missing_body_file"
+
+            gh pr comment "$PR_NUMBER" --body-file "$missing_body_file"
+            exit 1
+          fi
+
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$live_pr_json"
+
+          current_base_sha=$(jq -r '.base.sha // empty' "$live_pr_json")
+          current_head_sha=$(jq -r '.head.sha // empty' "$live_pr_json")
+          current_base_ref=$(jq -r '.base.ref // empty' "$live_pr_json")
+          current_head_ref=$(jq -r '.head.ref // empty' "$live_pr_json")
+
+          if [ "$current_base_sha" != "${{ steps.review_prepare.outputs.base_sha }}" ] || [ "$current_head_sha" != "${{ steps.review_prepare.outputs.head_sha }}" ]; then
+            stale_body_file="$RUNNER_TEMP/codex-review-stale.md"
+            {
+              echo "## Codex Review Failed"
+              echo
+              echo "The Codex review completed, but the pull request changed before the result could be posted as current."
+              echo
+              echo "- Reviewed base: ${{ steps.review_prepare.outputs.base_ref }} @ ${{ steps.review_prepare.outputs.base_sha }}"
+              echo "- Reviewed head: ${{ steps.review_prepare.outputs.head_ref }} @ ${{ steps.review_prepare.outputs.head_sha }}"
+              echo "- Current base: $current_base_ref @ $current_base_sha"
+              echo "- Current head: $current_head_ref @ $current_head_sha"
+              echo "- Action run: $RUN_URL"
+            } > "$stale_body_file"
+
+            gh pr comment "$PR_NUMBER" --body-file "$stale_body_file"
+            exit 1
+          fi
 
           {
             echo "## Codex Review"
             echo
             cat "$review_file"
+            printf '\n\n'
+            echo "---"
+            echo
+            echo "Reviewed revision metadata:"
+            echo
+            echo "- Base: ${{ steps.review_prepare.outputs.base_ref }} @ ${{ steps.review_prepare.outputs.base_sha }}"
+            echo "- Head: ${{ steps.review_prepare.outputs.head_ref }} @ ${{ steps.review_prepare.outputs.head_sha }}"
+            echo "- Merge base: ${{ steps.review_prepare.outputs.merge_base }}"
+            echo "- Prompt Unicode characters: ${{ steps.review_prepare.outputs.prompt_chars }}/${{ steps.review_prepare.outputs.prompt_limit }}"
+            echo "- Action run: $RUN_URL"
           } > "$body_file"
 
           gh pr comment "$PR_NUMBER" --body-file "$body_file"
