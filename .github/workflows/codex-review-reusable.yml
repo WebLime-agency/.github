@@ -317,8 +317,8 @@ jobs:
             exit "$status"
           fi
 
-          if [ ! -s "$review_file" ]; then
-            echo "codex exec completed without producing review output."
+          if [ ! -s "$review_file" ] || ! grep -q '[^[:space:]]' "$review_file"; then
+            echo "codex exec completed without producing a nonempty final message."
             sed \
               -e 's/sk-[A-Za-z0-9_-]*/[redacted-token]/g' \
               -e 's/Bearer [A-Za-z0-9._~+\/=-]*/Bearer [redacted]/g' \
@@ -338,7 +338,7 @@ jobs:
           {
             echo "## Codex Review Failed"
             echo
-            echo "The self-hosted Codex review command failed instead of posting a review."
+            echo "The self-hosted Codex review command failed or did not produce a nonempty final message."
             echo
             echo "- Exit code: ${{ steps.codex_review.outputs.exit_code || 'unknown' }}"
             echo "- Action run: $RUN_URL"
@@ -368,8 +368,17 @@ jobs:
           body_file="$RUNNER_TEMP/codex-review-comment.md"
           live_pr_json="$RUNNER_TEMP/pr-live.json"
 
-          if [ ! -s "$review_file" ]; then
-            echo "Review output is missing at post time."
+          if [ ! -s "$review_file" ] || ! grep -q '[^[:space:]]' "$review_file"; then
+            missing_body_file="$RUNNER_TEMP/codex-review-output-missing.md"
+            {
+              echo "## Codex Review Failed"
+              echo
+              echo "The Codex final message was missing or empty at post time, so no review verdict was posted."
+              echo
+              echo "- Action run: $RUN_URL"
+            } > "$missing_body_file"
+
+            gh pr comment "$PR_NUMBER" --body-file "$missing_body_file"
             exit 1
           fi
 
@@ -402,7 +411,7 @@ jobs:
             echo "## Codex Review"
             echo
             cat "$review_file"
-            echo
+            printf '\n\n'
             echo "---"
             echo
             echo "Reviewed revision metadata:"

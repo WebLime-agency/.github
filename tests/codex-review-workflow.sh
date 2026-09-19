@@ -183,15 +183,23 @@ done
 
 case "${CODEX_STUB_MODE:-success}" in
   success)
-    printf "Didn't find any major issues.\n" > "${review_file:?missing review file}"
+    printf %s "Didn't find any major issues." > "${review_file:?missing review file}"
     echo "thread.started"
     exit 0
     ;;
   fail)
     echo "input_too_large from stderr-only path" >&2
+    echo "Authorization: Bearer synthetic.bearer" >&2
+    echo "session_synthetic" >&2
+    echo '{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}' >&2
     exit 37
     ;;
   missing)
+    echo "thread.started"
+    exit 0
+    ;;
+  whitespace)
+    printf ' \n\t\n' > "${review_file:?missing review file}"
     echo "thread.started"
     exit 0
     ;;
@@ -206,7 +214,10 @@ STUB
 
 extract_steps() {
   mkdir -p "$STEPS_DIR"
+  extract_step "Configure shared Codex auth" "$STEPS_DIR/configure-codex-auth.sh"
+  extract_step "Report auth setup failure" "$STEPS_DIR/report-auth-setup-failure.sh"
   extract_step "Build review prompt" "$STEPS_DIR/build-review-prompt.sh"
+  extract_step "Report Codex review preparation failure" "$STEPS_DIR/report-prepare-failure.sh"
   extract_step "Run Codex review" "$STEPS_DIR/run-codex-review.sh"
   extract_step "Report Codex review failure" "$STEPS_DIR/report-codex-review-failure.sh"
   extract_step "Post Codex review" "$STEPS_DIR/post-codex-review.sh"
@@ -334,7 +345,7 @@ run_prepare() {
   set_common_env "$runner_temp"
   (
     cd "$repo"
-    bash "$STEPS_DIR/build-review-prompt.sh"
+    bash --noprofile --norc -e -o pipefail "$STEPS_DIR/build-review-prompt.sh"
   )
 }
 
@@ -411,9 +422,40 @@ test_caller_context_has_no_production_helper_dependency() {
   pass "workflow shell runs from caller checkout without repo-local helpers"
 }
 
-test_empty_diff_and_revision_mismatch_fail_prepare() {
+test_auth_failure_is_reported_distinctly() {
+  local runner_temp="$TMP_ROOT/runner-auth"
+  local status
+
+  set_common_env "$runner_temp"
+  set +e
+  CODEX_AUTH='' HOME="$TMP_ROOT/home-auth" \
+    bash --noprofile --norc -e -o pipefail "$STEPS_DIR/configure-codex-auth.sh"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "empty auth should fail configuration"
+  fi
+
+  set +e
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/report-auth-setup-failure.sh"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "auth failure reporting step should exit nonzero"
+  fi
+  assert_file_contains "$GH_COMMENT_LOG" "The shared Codex authentication setup failed before the review could run."
+  if [ -s "$NPX_INVOKED_LOG" ]; then
+    fail "auth failure should not invoke Codex"
+  fi
+
+  pass "authentication failure remains distinct and does not invoke Codex"
+}
+
+test_empty_diff_missing_commit_and_revision_mismatch_fail_prepare() {
   local repo_empty="$TMP_ROOT/empty"
   local runner_empty="$TMP_ROOT/runner-empty"
+  local repo_missing="$TMP_ROOT/missing"
+  local runner_missing="$TMP_ROOT/runner-missing"
   local repo_mismatch="$TMP_ROOT/mismatch"
   local runner_mismatch="$TMP_ROOT/runner-mismatch"
 
@@ -425,6 +467,21 @@ test_empty_diff_and_revision_mismatch_fail_prepare() {
     fail "empty cumulative diff should fail preparation"
   fi
   assert_file_contains "$runner_empty/codex-review-prepare.log" "Cumulative PR diff is empty"
+  if [ -s "$runner_empty/npx-invoked.log" ]; then
+    fail "empty diff should fail before Codex is invoked"
+  fi
+
+  create_multi_commit_fixture "$repo_missing"
+  export BASE_SHA HEAD_SHA
+  BASE_SHA=0000000000000000000000000000000000000000
+  HEAD_SHA=$(git -C "$repo_missing" rev-parse HEAD^2)
+  if run_prepare "$repo_missing" "$runner_missing"; then
+    fail "missing captured commit should fail preparation"
+  fi
+  assert_file_contains "$runner_missing/codex-review-prepare.log" "Captured base commit is not available"
+  if [ -s "$runner_missing/npx-invoked.log" ]; then
+    fail "missing commit should fail before Codex is invoked"
+  fi
 
   create_multi_commit_fixture "$repo_mismatch"
   export BASE_SHA HEAD_SHA
@@ -434,8 +491,11 @@ test_empty_diff_and_revision_mismatch_fail_prepare() {
     fail "checkout parent mismatch should fail preparation"
   fi
   assert_file_contains "$runner_mismatch/codex-review-prepare.log" "merge base parent does not match"
+  if [ -s "$runner_mismatch/npx-invoked.log" ]; then
+    fail "revision mismatch should fail before Codex is invoked"
+  fi
 
-  pass "empty diff and revision mismatch fail before Codex"
+  pass "empty diff, missing commit, and revision mismatch fail before Codex"
 }
 
 prepare_unicode_count() {
@@ -462,6 +522,7 @@ test_unicode_prompt_limit_boundaries() {
   local target
   local required_chars
   local measured
+  local runner_temp
   local status
 
   one_char_prompt=$(prepare_unicode_count 1)
@@ -494,7 +555,25 @@ test_unicode_prompt_limit_boundaries() {
     fail "expected oversized prompt size $target, measured $measured"
   fi
 
-  pass "Unicode prompt limit allows limit and fails limit plus one"
+  runner_temp="$TMP_ROOT/runner-unicode-$required_chars"
+  export RUNNER_TEMP="$runner_temp"
+  export GH_COMMENT_LOG="$runner_temp/gh-comments.md"
+  export NPX_INVOKED_LOG="$runner_temp/npx-invoked.log"
+  : > "$GH_COMMENT_LOG"
+  set +e
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/report-prepare-failure.sh"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "preparation failure reporting step should exit nonzero"
+  fi
+  assert_file_contains "$GH_COMMENT_LOG" "Prompt Unicode characters: 1048577"
+  assert_file_contains "$GH_COMMENT_LOG" "Maximum Unicode characters: 1048576"
+  if [ -s "$NPX_INVOKED_LOG" ]; then
+    fail "oversized prompt should fail before Codex is invoked"
+  fi
+
+  pass "Unicode prompt limit and preparation failure reporting preserve exact counts"
 }
 
 prepare_runtime_fixture() {
@@ -518,7 +597,7 @@ test_codex_exit_capture_and_diagnostics() {
   export CODEX_STUB_MODE=fail
 
   set +e
-  bash "$STEPS_DIR/run-codex-review.sh"
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/run-codex-review.sh"
   status=$?
   set -e
 
@@ -531,7 +610,7 @@ test_codex_exit_capture_and_diagnostics() {
   export GHA_CODEX_EXIT_CODE=37
   materialize_failure_step "$failure_step"
   set +e
-  bash "$failure_step"
+  bash --noprofile --norc -e -o pipefail "$failure_step"
   status=$?
   set -e
   if [ "$status" -eq 0 ]; then
@@ -539,11 +618,19 @@ test_codex_exit_capture_and_diagnostics() {
   fi
   assert_file_contains "$GH_COMMENT_LOG" "Exit code: 37"
   assert_file_contains "$GH_COMMENT_LOG" "input_too_large from stderr-only path"
+  assert_file_contains "$GH_COMMENT_LOG" "Bearer [redacted]"
+  assert_file_contains "$GH_COMMENT_LOG" "[redacted-session]"
+  assert_file_contains "$GH_COMMENT_LOG" "access_token:[redacted]"
+  assert_file_contains "$GH_COMMENT_LOG" "refresh_token:[redacted]"
+  assert_file_not_contains "$GH_COMMENT_LOG" "synthetic.bearer"
+  assert_file_not_contains "$GH_COMMENT_LOG" "session_synthetic"
+  assert_file_not_contains "$GH_COMMENT_LOG" "synthetic-access"
+  assert_file_not_contains "$GH_COMMENT_LOG" "synthetic-refresh"
 
-  pass "Codex nonzero exit is captured with stderr diagnostics"
+  pass "Codex nonzero exit is captured with redacted stderr diagnostics"
 }
 
-test_missing_output_cannot_reuse_stale_review() {
+test_missing_or_empty_output_cannot_reuse_stale_review() {
   local runner_temp="$TMP_ROOT/runner-runtime"
   local status
 
@@ -552,7 +639,7 @@ test_missing_output_cannot_reuse_stale_review() {
   printf "stale clean verdict\n" > "$runner_temp/codex-review.md"
 
   set +e
-  bash "$STEPS_DIR/run-codex-review.sh"
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/run-codex-review.sh"
   status=$?
   set -e
 
@@ -564,7 +651,16 @@ test_missing_output_cannot_reuse_stale_review() {
   fi
   assert_file_contains "$runner_temp/codex-review.log" "thread.started"
 
-  pass "missing output cannot reuse stale review file"
+  export CODEX_STUB_MODE=whitespace
+  set +e
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/run-codex-review.sh"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "whitespace-only Codex output should fail"
+  fi
+
+  pass "missing or empty output cannot reuse a stale review file"
 }
 
 test_success_and_stale_posting() {
@@ -574,21 +670,24 @@ test_success_and_stale_posting() {
 
   prepare_runtime_fixture
   export CODEX_STUB_MODE=success
-  bash "$STEPS_DIR/run-codex-review.sh"
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/run-codex-review.sh"
 
   materialize_post_step "$post_step"
-  bash "$post_step"
+  bash --noprofile --norc -e -o pipefail "$post_step"
   assert_file_contains "$GH_COMMENT_LOG" "## Codex Review"
   assert_file_contains "$GH_COMMENT_LOG" "Didn't find any major issues."
   assert_file_contains "$GH_COMMENT_LOG" "Reviewed revision metadata:"
   assert_file_contains "$GH_COMMENT_LOG" "Prompt Unicode characters: $GHA_PROMPT_CHARS/$GHA_PROMPT_LIMIT"
+  if ! awk 'previous == "Didn'\''t find any major issues." && $0 == "" { separated = 1 } { previous = $0 } END { exit separated ? 0 : 1 }' "$GH_COMMENT_LOG"; then
+    fail "review verdict and metadata should be separated even when the model output has no trailing newline"
+  fi
 
   : > "$GH_COMMENT_LOG"
   export GH_LIVE_MODE=moved
   export CURRENT_BASE_SHA="$GHA_BASE_SHA"
   export CURRENT_HEAD_SHA="3333333333333333333333333333333333333333"
   set +e
-  bash "$post_step"
+  bash --noprofile --norc -e -o pipefail "$post_step"
   status=$?
   set -e
 
@@ -598,7 +697,20 @@ test_success_and_stale_posting() {
   assert_file_contains "$GH_COMMENT_LOG" "pull request changed before the result could be posted as current"
   assert_file_not_contains "$GH_COMMENT_LOG" "Didn't find any major issues."
 
-  pass "success posts metadata and moved PR posts stale failure"
+  : > "$GH_COMMENT_LOG"
+  : > "$runner_temp/codex-review.md"
+  export GH_LIVE_MODE=match
+  set +e
+  bash --noprofile --norc -e -o pipefail "$post_step"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "missing output at post time should fail"
+  fi
+  assert_file_contains "$GH_COMMENT_LOG" "final message was missing or empty at post time"
+  assert_file_not_contains "$GH_COMMENT_LOG" "Didn't find any major issues."
+
+  pass "success, stale revisions, and missing post output are reported safely"
 }
 
 main() {
@@ -608,10 +720,11 @@ main() {
 
   test_cumulative_diff_and_manifest
   test_caller_context_has_no_production_helper_dependency
-  test_empty_diff_and_revision_mismatch_fail_prepare
+  test_auth_failure_is_reported_distinctly
+  test_empty_diff_missing_commit_and_revision_mismatch_fail_prepare
   test_unicode_prompt_limit_boundaries
   test_codex_exit_capture_and_diagnostics
-  test_missing_output_cannot_reuse_stale_review
+  test_missing_or_empty_output_cannot_reuse_stale_review
   test_success_and_stale_posting
 
   echo "1..$pass_count"
