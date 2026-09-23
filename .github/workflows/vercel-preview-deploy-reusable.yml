@@ -216,7 +216,11 @@ jobs:
                   return parse_ack(ack_frame)
 
           def main():
-              socket_path, frame = build_request_frame()
+              try:
+                  socket_path, frame = build_request_frame()
+              except TerminalNotifyError as exc:
+                  emit_error(exc.title, exc.message)
+                  return 1
               last_transient = None
 
               # Only accepted/duplicate ack proves transport delivery to this shim.

@@ -615,7 +615,7 @@ test_version_mismatch_ack_fail_closed() {
 
 test_request_guards_fail_before_send() {
   local out_file status socket_path mode_file received_file count_file ready_file server_pid actions
-  local oversized_repository
+  local oversized_repository expected_title
 
   actions=$(ack_actions 'unused\n')
   for case_name in bad-run-zero bad-run-text oversized-repository; do
@@ -630,14 +630,21 @@ test_request_guards_fail_before_send() {
 
     set_common_env "$TMP_ROOT/runner-$case_name" "$socket_path"
     case "$case_name" in
-      bad-run-zero) export POINTER_RUN_ID=0 ;;
-      bad-run-text) export POINTER_RUN_ID=not-a-number ;;
+      bad-run-zero)
+        export POINTER_RUN_ID=0
+        expected_title="Invalid pointer run_id"
+        ;;
+      bad-run-text)
+        export POINTER_RUN_ID=not-a-number
+        expected_title="Invalid pointer run_id"
+        ;;
       oversized-repository)
         oversized_repository=$(python3 - <<'PY'
 print("x" * 5000)
 PY
 )
         export POINTER_REPOSITORY="$oversized_repository"
+        expected_title="Request frame too large"
         ;;
     esac
 
@@ -652,7 +659,21 @@ PY
     if [ -s "$received_file" ]; then
       fail "$case_name should not send a request"
     fi
+    assert_file_contains "$out_file" "::error title=$expected_title::"
+    assert_file_not_contains "$out_file" "Traceback"
   done
+
+  out_file="$TMP_ROOT/missing-socket-guard.out"
+  set_common_env "$TMP_ROOT/runner-missing-socket-guard" ""
+  set +e
+  bash --noprofile --norc -e -o pipefail "$STEPS_DIR/notify-vercel-preview-broker.sh" >"$out_file" 2>&1
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "missing broker socket should fail before send"
+  fi
+  assert_file_contains "$out_file" "::error title=Missing broker socket::"
+  assert_file_not_contains "$out_file" "Traceback"
   pass "request guards fail before send for invalid or oversize pointers"
 }
 
