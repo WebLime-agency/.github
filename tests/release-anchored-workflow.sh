@@ -455,5 +455,27 @@ run_step_ok "$STEPS_DIR/release.sh" "$TMP_ROOT/release-draft.log" \
 assert_file_contains "$RELEASE_LOG" "--draft"
 pass "draft mode creates the release as a draft"
 
+# --------------------------------------------------------------- labels -----
+
+# GitHub rejects a label description over 100 characters with HTTP 422, part
+# way through the loop, leaving the repository with some labels created and
+# some missing. The script checks every entry before writing anything.
+LABEL_SCRIPT="$ROOT_DIR/scripts/sync-release-labels.sh"
+
+if ! bash "$LABEL_SCRIPT" --dry-run acme/app > "$TMP_ROOT/labels-dryrun.log" 2>&1; then
+  cat "$TMP_ROOT/labels-dryrun.log" >&2
+  fail "label sync dry-run should succeed"
+fi
+assert_file_contains "$TMP_ROOT/labels-dryrun.log" "Syncing 7 release labels"
+pass "label sync lists all seven labels in dry-run and writes nothing"
+
+while IFS='|' read -r name _ description; do
+  [ -n "$name" ] || continue
+  if [ "${#description}" -gt 100 ]; then
+    fail "label description for $name is ${#description} characters; GitHub allows 100"
+  fi
+done < <(sed -n "s/^  '\(release\/[a-z]*\)|\([0-9a-f]*\)|\(.*\)'$/||/p" "$LABEL_SCRIPT")
+pass "every label description fits GitHub's 100 character limit"
+
 echo
 echo "All $pass_count checks passed."

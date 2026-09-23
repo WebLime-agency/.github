@@ -62,10 +62,21 @@ LABELS=(
   'release/improved|1d76db|User-facing: an existing thing works better. Appears in release notes and marketing input.'
   'release/fixed|b60205|User-facing: a bug fix. Appears in release notes and marketing input.'
   'release/api|5319e7|Integrations and API surface. Appears in release notes and marketing input.'
-  'release/security|d93f0b|Security and reliability. In the release notes, NOT in the machine-readable payload. Titles must never be exploitable.'
+  'release/security|d93f0b|Security and reliability. In the notes, not the marketing payload. Never an exploitable title.'
   'release/internal|6a737d|Internal only. Collapsed in the release notes, excluded from marketing input.'
   'release/skip|c5def5|Excluded from release notes entirely.'
 )
+
+# GitHub caps label descriptions at 100 characters and rejects the request with
+# HTTP 422. Check every entry up front, so a too-long description cannot leave
+# the repository with half its labels created.
+for ENTRY in "${LABELS[@]}"; do
+  IFS='|' read -r NAME _ DESCRIPTION <<< "${ENTRY}"
+  if [ "${#DESCRIPTION}" -gt 100 ]; then
+    echo "Description for ${NAME} is ${#DESCRIPTION} characters; GitHub allows 100." >&2
+    exit 1
+  fi
+done
 
 echo "Syncing ${#LABELS[@]} release labels to ${REPO}"
 
