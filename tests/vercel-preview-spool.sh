@@ -482,6 +482,100 @@ test_absolute_python_ignores_path_shadow() {
   pass "trusted notify step ignores PATH-shadowed python3"
 }
 
+test_python_import_environment_is_isolated() {
+  local attacker_dir="$TMP_ROOT/attacker-cwd"
+  local fake_home="$TMP_ROOT/attacker-home"
+  local python_version user_site startup_file
+  local socket_path="$TMP_ROOT/import-isolation.sock"
+  local mode_file="$TMP_ROOT/import-isolation-actions.json"
+  local received_file="$TMP_ROOT/import-isolation-received.bin"
+  local count_file="$TMP_ROOT/import-isolation-count.txt"
+  local ready_file="$TMP_ROOT/import-isolation-ready"
+  local out_file="$TMP_ROOT/import-isolation.out"
+  local server_pid status marker
+
+  python_version=$(/usr/bin/python3 -I -S -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  user_site="$fake_home/.local/lib/python$python_version/site-packages"
+  startup_file="$attacker_dir/pythonstartup.py"
+  mkdir -p "$attacker_dir" "$user_site"
+
+  cat > "$attacker_dir/json.py" <<'PY'
+import os
+with open(os.environ["ATTACK_JSON_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write("json\n")
+PY
+  cat > "$attacker_dir/socket.py" <<'PY'
+import os
+with open(os.environ["ATTACK_SOCKET_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write("socket\n")
+PY
+  cat > "$attacker_dir/sitecustomize.py" <<'PY'
+import os
+with open(os.environ["ATTACK_SITE_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write("sitecustomize\n")
+PY
+  cat > "$user_site/usercustomize.py" <<'PY'
+import os
+with open(os.environ["ATTACK_USER_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write("usercustomize\n")
+PY
+  cat > "$startup_file" <<'PY'
+import os
+with open(os.environ["ATTACK_STARTUP_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write("startup\n")
+PY
+
+  write_actions "$mode_file" "$(complete_ack_actions "$(accepted_ack)")"
+  server_pid=$(start_fake_server "$socket_path" "$mode_file" "$received_file" "$count_file" "$ready_file")
+  set_common_env "$TMP_ROOT/runner-import-isolation" "$socket_path"
+
+  set +e
+  (
+    export HOME="$fake_home"
+    export PYTHONPATH="$attacker_dir"
+    export PYTHONSTARTUP="$startup_file"
+    export ATTACK_JSON_MARKER="$TMP_ROOT/attacker-json-ran"
+    export ATTACK_SOCKET_MARKER="$TMP_ROOT/attacker-socket-ran"
+    export ATTACK_SITE_MARKER="$TMP_ROOT/attacker-sitecustomize-ran"
+    export ATTACK_USER_MARKER="$TMP_ROOT/attacker-usercustomize-ran"
+    export ATTACK_STARTUP_MARKER="$TMP_ROOT/attacker-startup-ran"
+    cd "$attacker_dir"
+    "$BASH" --noprofile --norc -e -o pipefail "$STEPS_DIR/notify-vercel-preview-broker.sh"
+  ) >"$out_file" 2>&1
+  status=$?
+  set -e
+
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
+  if kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+  fi
+
+  if [ "$status" -ne 0 ]; then
+    sed -n '1,200p' "$out_file" >&2 || true
+    fail "trusted notify step should succeed under hostile Python environment"
+  fi
+  for marker in \
+    "$TMP_ROOT/attacker-json-ran" \
+    "$TMP_ROOT/attacker-socket-ran" \
+    "$TMP_ROOT/attacker-sitecustomize-ran" \
+    "$TMP_ROOT/attacker-usercustomize-ran" \
+    "$TMP_ROOT/attacker-startup-ran"; do
+    if [ -e "$marker" ]; then
+      fail "trusted notify step executed attacker Python code: $marker"
+    fi
+  done
+  assert_single_strict_request "$received_file"
+  if [ "$(request_count "$count_file")" != "1" ]; then
+    fail "isolated Python notify should use exactly one connection"
+  fi
+  pass "trusted Python ignores hostile cwd, user site, PYTHONPATH, and PYTHONSTARTUP"
+}
+
 test_python3_preflight_fails_closed() {
   local runner_temp="$TMP_ROOT/runner-preflight"
   local out_file="$TMP_ROOT/preflight.out"
@@ -809,10 +903,12 @@ test_token_output_isolation_static() {
 }
 
 test_inline_client_and_no_helper_static() {
-  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "/usr/bin/python3 <<'PY'"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "cd -- /"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "PYTHONSAFEPATH=1 /usr/bin/python3 -I -S - <<'PY'"
   assert_file_contains "$DEPLOY_WORKFLOW_FILE" "/usr/bin/stat"
   assert_file_contains "$DEPLOY_WORKFLOW_FILE" "Untrusted python3 owner"
   assert_file_contains "$DEPLOY_WORKFLOW_FILE" "Unsafe python3 permissions"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "Unsafe neutral directory"
   assert_file_not_contains "$DEPLOY_WORKFLOW_FILE" "command -v python3"
   if grep -Eq '^[[:space:]]*(python3|stat|curl|socat|nc|jq)([[:space:]]|$)' "$STEPS_DIR/notify-vercel-preview-broker.sh"; then
     fail "trusted notify step contains a bare-name external executable"
@@ -873,6 +969,7 @@ main() {
   test_pr_build_has_no_persisted_token_or_blanket_vars
   test_broker_pointer_is_documented_as_untrusted
   test_absolute_python_ignores_path_shadow
+  test_python_import_environment_is_isolated
   test_python3_preflight_fails_closed
   test_exact_request_and_accepted_success
   test_duplicate_success_transport_only

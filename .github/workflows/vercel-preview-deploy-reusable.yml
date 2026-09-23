@@ -58,7 +58,18 @@ jobs:
             exit 1
           fi
 
-          /usr/bin/python3 <<'PY'
+          if ! NEUTRAL_DIR_METADATA="$(/usr/bin/stat -Lc '%u %a' / 2>/dev/null)"; then
+            echo "::error title=Neutral directory metadata failure::Unable to verify ownership and permissions for the trusted working directory."
+            exit 1
+          fi
+          read -r NEUTRAL_DIR_OWNER NEUTRAL_DIR_MODE <<< "$NEUTRAL_DIR_METADATA"
+          if [ "$NEUTRAL_DIR_OWNER" != "0" ] || [[ ! "$NEUTRAL_DIR_MODE" =~ ^[0-7]{3,4}$ ]] || (( (8#$NEUTRAL_DIR_MODE & 0022) != 0 )); then
+            echo "::error title=Unsafe neutral directory::The trusted working directory must be root-owned and not group- or world-writable."
+            exit 1
+          fi
+          cd -- /
+
+          PYTHONSAFEPATH=1 /usr/bin/python3 -I -S - <<'PY'
           import json
           import os
           import socket
