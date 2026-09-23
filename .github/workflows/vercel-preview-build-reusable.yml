@@ -76,25 +76,3 @@ jobs:
             echo ".vercel/output is empty."
             exit 1
           fi
-
-      - name: Write PR number
-        run: printf '%s\n' '${{ github.event.pull_request.number }}' > pr-number.txt
-
-      - name: Package Vercel output
-        run: |
-          set -euo pipefail
-
-          tar -czf vercel-preview-output.tar.gz .vercel/output
-          tar -tzf vercel-preview-output.tar.gz > vercel-preview-output-contents.txt
-          grep -Fxq '.vercel/output/config.json' vercel-preview-output-contents.txt
-
-      - name: Upload Vercel output
-        uses: actions/upload-artifact@v4
-        with:
-          name: vercel-preview-output
-          path: |
-            vercel-preview-output.tar.gz
-            pr-number.txt
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1

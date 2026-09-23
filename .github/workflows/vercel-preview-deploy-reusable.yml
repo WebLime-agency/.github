@@ -1,22 +1,21 @@
 name: Vercel Preview Deploy (reusable)
 
-# Central reusable workflow — lives in WebLime-agency/.github.
+# Central reusable workflow - lives in WebLime-agency/.github.
 # Contract: the stage-2 caller must trigger on workflow_run for the stage-1
 # caller's workflow name. The fleet callers use "Vercel Preview Build".
+# This shim only notifies the trusted broker. The broker preserves the sticky PR
+# comment contract: header vercel-preview, ## Vercel Preview, Preview deployment:
 
 on:
   workflow_call:
     inputs:
-      vercel_cli_version:
-        description: "Pinned Vercel CLI version to install."
+      expected_build_workflow_name:
+        description: "Caller workflow name expected to complete before notifying the broker."
         required: false
         type: string
-        default: 56.3.1
+        default: Vercel Preview Build
 
-permissions:
-  actions: read
-  contents: read
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: vercel-preview-deploy-${{ github.event.workflow_run.pull_requests[0].number }}
@@ -24,78 +23,216 @@ concurrency:
 
 jobs:
   deploy-preview:
-    name: Deploy Vercel preview output
-    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository
+    name: Notify Vercel preview broker
+    # This is a noise-reduction gate only. The broker owns the authoritative
+    # trust check for repository, run, event, conclusion, PR, and head revision.
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.repository.full_name == github.repository && github.event.workflow_run.name == inputs.expected_build_workflow_name
     runs-on: [self-hosted, Linux, X64, weblime-ci]
-    environment: vercel-preview
-    env:
-      VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
-      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
     steps:
-      - name: Install Vercel CLI
+      - name: Notify Vercel preview broker
         env:
-          npm_config_registry: https://registry.npmjs.org/
-        run: npm install -g vercel@${{ inputs.vercel_cli_version }} --ignore-scripts
-
-      - name: Download Vercel output
-        uses: actions/download-artifact@v4
-        with:
-          name: vercel-preview-output
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Vercel output
+          BROKER_SOCKET_PATH: ${{ vars.VERCEL_PREVIEW_BROKER_SOCKET_PATH }}
+          POINTER_REPOSITORY: ${{ github.repository }}
+          POINTER_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
 
-          test -f vercel-preview-output.tar.gz
-          tar -xzf vercel-preview-output.tar.gz
-          test -d .vercel/output
-          test -f .vercel/output/config.json
-
-      - name: Read PR number
-        id: pr
-        run: |
-          set -euo pipefail
-
-          PR_NUMBER="$(tr -d '[:space:]' < pr-number.txt)"
-          if [ -z "$PR_NUMBER" ]; then
-            echo "pr-number.txt did not contain a PR number."
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error title=Missing python3::python3 is required for the AF_UNIX notify shim; no fallback client is attempted."
             exit 1
           fi
 
-          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          python3 <<'PY'
+          import json
+          import os
+          import socket
+          import sys
+          import time
 
-      - name: Deploy Vercel preview
-        id: deploy
-        env:
-          npm_config_registry: https://registry.npmjs.org/
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: |
-          set -euo pipefail
+          CONTRACT_VERSION = "1"
+          REQUEST_MAX_BYTES = 4096
+          ACK_MAX_BYTES = 1024
+          DEADLINE_SECONDS = 2.0
+          MAX_ATTEMPTS = 4
+          RETRY_BACKOFF_SECONDS = (0.2, 0.4, 0.8)
+          EXPECTED_REQUEST_KEYS = ("version", "repository", "run_id")
+          EXPECTED_ACK_KEYS = {"status", "version", "request_id", "reason", "retryable"}
+          SUCCESS_STATUSES = {"accepted", "duplicate"}
+          TERMINAL_REASONS = {"unsupported_version", "malformed", "unauthorized_peer", "unknown_repository"}
+          RETRYABLE_REASONS = {"rate_limited", "backpressure"}
 
-          test -d .vercel/output
-          test -f .vercel/output/config.json
+          class TerminalNotifyError(Exception):
+              def __init__(self, title, message):
+                  super().__init__(message)
+                  self.title = title
+                  self.message = message
 
-          DEPLOY_OUTPUT="$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")"
-          printf '%s\n' "$DEPLOY_OUTPUT"
+          class TransientNotifyError(Exception):
+              pass
 
-          DEPLOYMENT_URL="$(printf '%s\n' "$DEPLOY_OUTPUT" | grep -Eo 'https://[^[:space:]]+\.vercel\.app[^[:space:]]*' | tail -n 1 || true)"
-          if [ -z "$DEPLOYMENT_URL" ]; then
-            echo "Unable to find a Vercel deployment URL in deploy output."
-            exit 1
-          fi
+          def annotation_escape(value):
+              return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
-          echo "deployment_url=$DEPLOYMENT_URL" >> "$GITHUB_OUTPUT"
+          def emit_error(title, message):
+              print(f"::error title={annotation_escape(title)}::{annotation_escape(message)}", file=sys.stderr)
 
-      - name: Comment preview URL
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          number: ${{ steps.pr.outputs.number }}
-          header: vercel-preview
-          message: |
-            ## Vercel Preview
+          def reject_duplicate_pairs(pairs):
+              seen = set()
+              obj = {}
+              for key, value in pairs:
+                  if key in seen:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  seen.add(key)
+                  obj[key] = value
+              return obj
 
-            Preview deployment: ${{ steps.deploy.outputs.deployment_url }}
+          def build_request_frame():
+              socket_path = os.environ.get("BROKER_SOCKET_PATH", "")
+              repository = os.environ.get("POINTER_REPOSITORY", "")
+              run_id_raw = os.environ.get("POINTER_RUN_ID", "")
 
-            This deployment is created by GitHub Actions from a prebuilt artifact. PR code never runs in a job that has the Vercel token.
+              if not socket_path:
+                  raise TerminalNotifyError(
+                      "Missing broker socket",
+                      "Set the non-secret VERCEL_PREVIEW_BROKER_SOCKET_PATH Variable before activating preview notifications.",
+                  )
+              if not repository:
+                  raise TerminalNotifyError("Invalid pointer repository", "github.repository was empty.")
+              if not run_id_raw.isdecimal():
+                  raise TerminalNotifyError("Invalid pointer run_id", "workflow_run.id must be a positive integer.")
+
+              run_id = int(run_id_raw, 10)
+              if run_id <= 0:
+                  raise TerminalNotifyError("Invalid pointer run_id", "workflow_run.id must be greater than zero.")
+
+              pointer = {"version": CONTRACT_VERSION, "repository": repository, "run_id": run_id}
+              if tuple(pointer.keys()) != EXPECTED_REQUEST_KEYS:
+                  raise TerminalNotifyError("Invalid pointer schema", "Request pointer must contain exactly version, repository, and run_id.")
+
+              frame = (json.dumps(pointer, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+              if not frame.endswith(b"\n"):
+                  raise TerminalNotifyError("Invalid pointer frame", "Request pointer must be newline terminated.")
+              if len(frame) > REQUEST_MAX_BYTES:
+                  raise TerminalNotifyError("Request frame too large", "Request pointer exceeded the 4 KiB frame limit.")
+              return socket_path, frame
+
+          def read_ack_frame(sock):
+              buffer = b""
+              while True:
+                  if len(buffer) > ACK_MAX_BYTES:
+                      raise TerminalNotifyError("Broker ack frame too large", "Broker ACK exceeded the 1 KiB frame limit before a newline.")
+                  try:
+                      chunk = sock.recv(min(256, ACK_MAX_BYTES + 1 - len(buffer)))
+                  except socket.timeout as exc:
+                      raise TransientNotifyError("ACK read timed out before newline.") from exc
+                  except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                      raise TransientNotifyError(f"Connection lost while reading ACK: {exc.__class__.__name__}.") from exc
+
+                  if not chunk:
+                      if buffer:
+                          raise TransientNotifyError("Connection closed before ACK newline.")
+                      raise TransientNotifyError("Connection closed before any ACK bytes.")
+
+                  buffer += chunk
+                  newline_index = buffer.find(b"\n")
+                  if newline_index == -1:
+                      continue
+                  if newline_index + 1 > ACK_MAX_BYTES:
+                      raise TerminalNotifyError("Broker ack frame too large", "Broker ACK exceeded the 1 KiB frame limit.")
+                  if buffer[newline_index + 1:]:
+                      raise TerminalNotifyError("Malformed broker ack", "Broker sent trailing bytes after the ACK frame.")
+                  return buffer[:newline_index]
+
+          def parse_ack(frame):
+              try:
+                  text = frame.decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK was not valid UTF-8.") from exc
+
+              try:
+                  decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_pairs)
+                  ack, end_index = decoder.raw_decode(text)
+              except (json.JSONDecodeError, ValueError) as exc:
+                  raise TerminalNotifyError("Malformed broker ack", f"Broker ACK JSON was invalid: {exc}") from exc
+
+              if text[end_index:].strip():
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK contained trailing data after the JSON object.")
+              if not isinstance(ack, dict):
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK must be a JSON object.")
+              if set(ack.keys()) != EXPECTED_ACK_KEYS:
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK must contain exactly status, version, request_id, reason, and retryable.")
+
+              status = ack["status"]
+              version = ack["version"]
+              request_id = ack["request_id"]
+              reason = ack["reason"]
+              retryable = ack["retryable"]
+
+              if version != CONTRACT_VERSION:
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK version did not match contract version 1.")
+              if status not in SUCCESS_STATUSES and status != "rejected":
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK status was not accepted, duplicate, or rejected.")
+              if not isinstance(request_id, str) or not request_id:
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK request_id must be a non-empty string.")
+              if not isinstance(retryable, bool):
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK retryable must be a boolean.")
+
+              if status in SUCCESS_STATUSES:
+                  if reason is not None or retryable is not False:
+                      raise TerminalNotifyError("Malformed broker ack", "Accepted or duplicate ACK must carry reason null and retryable false.")
+                  return status, None
+
+              if reason not in TERMINAL_REASONS | RETRYABLE_REASONS:
+                  raise TerminalNotifyError("Malformed broker ack", "Rejected ACK reason was not recognized.")
+              expected_retryable = reason in RETRYABLE_REASONS
+              if retryable is not expected_retryable:
+                  raise TerminalNotifyError("Malformed broker ack", "Rejected ACK retryable flag did not match its reason.")
+              if retryable:
+                  raise TransientNotifyError(f"Broker rejected pointer with retryable reason: {reason}.")
+              raise TerminalNotifyError("Broker rejected pointer", f"Broker rejected pointer with terminal reason: {reason}.")
+
+          def notify_once(socket_path, frame):
+              with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                  sock.settimeout(DEADLINE_SECONDS)
+                  try:
+                      sock.connect(socket_path)
+                      sock.sendall(frame)
+                  except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError, socket.timeout) as exc:
+                      raise TransientNotifyError(f"Broker channel was unavailable during connect/write: {exc.__class__.__name__}.") from exc
+                  except OSError as exc:
+                      raise TerminalNotifyError("Broker channel error", f"Broker channel failed before send: {exc.__class__.__name__}.") from exc
+
+                  ack_frame = read_ack_frame(sock)
+                  return parse_ack(ack_frame)
+
+          def main():
+              socket_path, frame = build_request_frame()
+              last_transient = None
+
+              # Only accepted/duplicate ack proves transport delivery to this shim.
+              # A cancelled workflow after accepted may still be acted on by the
+              # broker. Without a valid ACK, the send is acceptance-unknown and is
+              # retried byte-identically while this step is still running.
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  try:
+                      status, _ = notify_once(socket_path, frame)
+                      print(f"Broker preview pointer {status}; transport-delivered only.")
+                      return 0
+                  except TransientNotifyError as exc:
+                      last_transient = exc
+                      if attempt == MAX_ATTEMPTS:
+                          break
+                      print(f"Transient broker notify error on attempt {attempt}; retrying byte-identical pointer.", file=sys.stderr)
+                      time.sleep(RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)])
+                  except TerminalNotifyError as exc:
+                      emit_error(exc.title, exc.message)
+                      return 1
+
+              emit_error(
+                  "Broker notify retry budget exhausted",
+                  f"Preview pointer delivery remains acceptance-unknown after {MAX_ATTEMPTS} attempts: {last_transient}",
+              )
+              return 1
+
+          sys.exit(main())
+          PY
