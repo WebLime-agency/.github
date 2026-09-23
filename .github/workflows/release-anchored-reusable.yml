@@ -1,0 +1,473 @@
+name: Production Release (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Produces a GitHub Release anchored to a production branch commit that is
+# PROVEN deployed: every workflow named in `required_deploy_workflows` must
+# have concluded `success` for that exact head_sha on the production branch.
+#
+# Design notes:
+#   - release-drafter ALWAYS runs with `dry-run: true`. This workflow owns
+#     release create/update, because on GitHub the action only ever updates a
+#     DRAFT (it looks for `releases.find(r => r.draft)` with no tag match), so
+#     a re-run against a published tag would take its create path and collide,
+#     and a leftover draft from an earlier SHA would be silently overwritten.
+#   - Tags are immutable: annotated, never force-pushed. A movable deployment
+#     pointer such as `deployable-dev` is never used as release history.
+#   - Every `run:` step is a plain bash block, so
+#     tests/release-anchored-workflow.sh can extract and execute it against
+#     stubbed `gh` and `git`.
+
+on:
+  workflow_call:
+    inputs:
+      required_deploy_workflows:
+        description: "Comma-separated workflow filenames that must have concluded success for the same production SHA."
+        required: true
+        type: string
+      sha:
+        description: "Explicit SHA to release. Blank resolves from the triggering event, then the production branch tip."
+        required: false
+        type: string
+        default: ""
+      mode:
+        description: "dry-run (write nothing) | draft | publish."
+        required: false
+        type: string
+        default: publish
+      tag_prefix:
+        description: "Prefix for release tags."
+        required: false
+        type: string
+        default: v
+      production_branch:
+        description: "Branch production is deployed from."
+        required: false
+        type: string
+        default: main
+      config_name:
+        description: "release-drafter config file, relative to .github/."
+        required: false
+        type: string
+        default: release-drafter.yml
+      max_commits:
+        description: "Refuse a range larger than this, rather than risk truncated notes."
+        required: false
+        type: number
+        default: 300
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: write
+
+concurrency:
+  # Both production deploy workflows completing will each trigger a caller run
+  # for the same SHA. Queue them; the second is a no-op via the tag check.
+  group: production-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
+    steps:
+      - name: Validate mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          case "${MODE}" in
+            dry-run|draft|publish)
+              echo "mode: ${MODE}"
+              ;;
+            *)
+              echo "::error title=Invalid mode::mode must be dry-run, draft or publish (got '${MODE}')."
+              exit 1
+              ;;
+          esac
+
+      - name: Gate on a proven production deploy
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+          PRODUCTION_BRANCH: ${{ inputs.production_branch }}
+          REQUIRED_WORKFLOWS: ${{ inputs.required_deploy_workflows }}
+        run: |
+          set -euo pipefail
+
+          TIP=$(gh api "repos/${REPO}/git/ref/heads/${PRODUCTION_BRANCH}" --jq '.object.sha')
+          echo "Current ${PRODUCTION_BRANCH} tip: ${TIP}"
+
+          CANDIDATE="${INPUT_SHA}"
+          SOURCE="workflow input"
+          if [ -z "${CANDIDATE}" ] && [ "${EVENT_NAME}" = "workflow_run" ]; then
+            CANDIDATE="${TRIGGER_SHA}"
+            SOURCE="triggering deploy run"
+          fi
+          if [ -z "${CANDIDATE}" ]; then
+            CANDIDATE="${TIP}"
+            SOURCE="${PRODUCTION_BRANCH} tip"
+          fi
+          echo "Candidate SHA (${SOURCE}): ${CANDIDATE}"
+
+          # Only the live production tip is ever released. A late-finishing or
+          # replayed deploy run must not produce a release for a superseded
+          # commit; its commits are covered by the next release's range, which
+          # starts from the previous release TAG rather than this SHA.
+          if [ "${CANDIDATE}" != "${TIP}" ]; then
+            if [ "${EVENT_NAME}" = "workflow_run" ]; then
+              echo "::notice title=Superseded commit::${CANDIDATE} is no longer the ${PRODUCTION_BRANCH} tip (${TIP}). Skipping; a later release covers it."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::error title=Not a production commit::${CANDIDATE} is not the current ${PRODUCTION_BRANCH} tip (${TIP}). Only the deployed production commit can be released."
+            exit 1
+          fi
+
+          PENDING=""
+          SUMMARY=""
+          IFS=',' read -r -a WORKFLOWS <<< "${REQUIRED_WORKFLOWS}"
+          for RAW in "${WORKFLOWS[@]}"; do
+            WORKFLOW="${RAW// /}"
+            [ -n "${WORKFLOW}" ] || continue
+
+            RUNS=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${PRODUCTION_BRANCH}&head_sha=${CANDIDATE}&per_page=1")
+            CONCLUSION=$(printf '%s' "${RUNS}" | jq -r '.workflow_runs[0].conclusion // "missing"')
+            RUN_URL=$(printf '%s' "${RUNS}" | jq -r '.workflow_runs[0].html_url // ""')
+
+            echo "  ${WORKFLOW}: ${CONCLUSION}"
+            SUMMARY="${SUMMARY}- \`${WORKFLOW}\`: ${CONCLUSION} ${RUN_URL}"$'\n'
+
+            if [ "${CONCLUSION}" != "success" ]; then
+              PENDING="${PENDING} ${WORKFLOW}(${CONCLUSION})"
+            fi
+          done
+
+          # A pending deploy is NOT a failure. The other workflow's completion
+          # re-triggers the caller; failing here would open a spurious issue on
+          # every deploy and teach everyone to ignore the alerts.
+          if [ -n "${PENDING}" ]; then
+            echo "::notice title=Production deploy not proven::Waiting on:${PENDING}. No-op; the remaining deploy workflow will re-trigger this."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "sha=${CANDIDATE}"
+            echo "deploy_summary<<GATE_SUMMARY_EOF"
+            printf '%s' "${SUMMARY}"
+            echo "GATE_SUMMARY_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout the production commit
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.gate.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Compute release range
+        id: range
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          MAX_COMMITS: ${{ inputs.max_commits }}
+        run: |
+          set -euo pipefail
+
+          PREV_TAG=$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}[0-9]*" "${SHA}^" 2>/dev/null || true)
+          if [ -n "${PREV_TAG}" ]; then
+            RANGE="${PREV_TAG}..${SHA}"
+          else
+            RANGE="${SHA}"
+            echo "::warning title=No previous release tag::Walking the full history. Expect this only before the baseline release exists."
+          fi
+          echo "Range: ${RANGE}"
+
+          COMMITS=$(git log --format=%H "${RANGE}")
+          COMMIT_COUNT=$(printf '%s' "${COMMITS}" | grep -c . || true)
+          echo "Commits in range: ${COMMIT_COUNT}"
+          git log --oneline "${RANGE}" || true
+
+          if [ "${COMMIT_COUNT}" -gt "${MAX_COMMITS}" ]; then
+            echo "::error title=Range too large::${COMMIT_COUNT} commits exceeds max_commits=${MAX_COMMITS}. Release notes would risk silent truncation; release a smaller range or raise the limit deliberately."
+            exit 1
+          fi
+
+          : > prs.ndjson
+          for COMMIT in ${COMMITS}; do
+            gh api "repos/${REPO}/commits/${COMMIT}/pulls" \
+              --jq '.[] | {number: .number, title: .title, labels: [.labels[].name]}' >> prs.ndjson
+          done
+          jq -s 'unique_by(.number) | sort_by(.number)' prs.ndjson > prs.json
+
+          PR_COUNT=$(jq 'length' prs.json)
+          echo "Pull requests in range: ${PR_COUNT}"
+
+          # Expected = everything release-drafter should render. It excludes
+          # release/skip (exclude-labels) but keeps release/internal, which is
+          # rendered collapsed, and unlabelled PRs, which render uncategorised.
+          jq -r '.[] | select(.labels | index("release/skip") | not) | .number' prs.json | sort -n -u > expected_prs.txt
+          EXPECTED_COUNT=$(grep -c . expected_prs.txt || true)
+
+          RELEASABLE=$(jq '[.[] | select((.labels | index("release/skip") | not) and (.labels | index("release/internal") | not))] | length' prs.json)
+          echo "Releasable (customer-visible or unlabelled): ${RELEASABLE}"
+
+          {
+            echo "## Release range"
+            echo
+            echo "- Production SHA: \`${SHA}\`"
+            echo "- Previous release tag: \`${PREV_TAG:-none}\`"
+            echo "- Commits: ${COMMIT_COUNT}"
+            echo "- Pull requests: ${PR_COUNT} (expected in notes: ${EXPECTED_COUNT})"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # An empty range, or one holding only skipped and internal work,
+          # produces no tag and no release. The next deploy's range starts from
+          # the previous release tag, so nothing is lost.
+          if [ "${RELEASABLE}" -eq 0 ]; then
+            echo "::notice title=Nothing to release::No customer-visible changes in ${RANGE}. No tag and no release created."
+            echo "- **Result:** nothing to release." >> "${GITHUB_STEP_SUMMARY}"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "prev_tag=${PREV_TAG}"
+            echo "commit_count=${COMMIT_COUNT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve and create the release tag
+        id: tag
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          # Re-running against an already-tagged SHA reuses its tag, which is
+          # what makes the whole workflow idempotent.
+          EXISTING=$(git tag --points-at "${SHA}" --list "${TAG_PREFIX}[0-9]*" | head -n 1)
+
+          if [ -n "${EXISTING}" ]; then
+            TAG="${EXISTING}"
+            echo "Reusing existing tag ${TAG} at ${SHA}"
+          else
+            # Unpadded CalVer. Zero-padded months fail release-drafter's semver
+            # coercion, which silently drops our own previous releases from the
+            # candidate set and makes every run behave like the first.
+            BASE="${TAG_PREFIX}$(date -u +%Y.%-m.%-d)"
+            TAG="${BASE}"
+            SUFFIX=1
+            while git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; do
+              SUFFIX=$((SUFFIX + 1))
+              TAG="${BASE}.${SUFFIX}"
+            done
+            echo "New tag: ${TAG}"
+          fi
+
+          POINTS_AT=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}" 2>/dev/null || true)
+          if [ -n "${POINTS_AT}" ] && [ "${POINTS_AT}" != "${SHA}" ]; then
+            echo "::error title=Tag conflict::${TAG} already points at ${POINTS_AT}, not ${SHA}. Release tags are immutable and are never moved."
+            exit 1
+          fi
+
+          if [ "${MODE}" = "dry-run" ]; then
+            echo "[dry-run] would create annotated tag ${TAG} at ${SHA}"
+          elif [ -n "${EXISTING}" ]; then
+            echo "Tag ${TAG} already exists at ${SHA}; nothing to push."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "Release ${TAG}" "${SHA}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate release notes
+        id: notes
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        # Pinned to v7.7.0. `uses:` cannot take an expression, so this ref is
+        # literal by necessity; bump it deliberately.
+        uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9
+        with:
+          config-name: ${{ inputs.config_name }}
+          commitish: ${{ steps.gate.outputs.sha }}
+          tag: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          version: ${{ steps.tag.outputs.tag }}
+          dry-run: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify the notes cover the whole range
+        id: verify
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        env:
+          BODY: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "${BODY}" > notes_body.md
+
+          # release-drafter's history-limit (15 pages) and pull-request-limit
+          # (5 associated PRs per commit) can truncate a long range silently. A
+          # short release is worse than a failed one, so compare its output
+          # against the set we computed ourselves.
+          grep -oE '#[0-9]+' notes_body.md | tr -d '#' | sort -n -u > notes_prs.txt || true
+
+          if ! diff -u expected_prs.txt notes_prs.txt > prs.diff; then
+            echo "::error title=Release notes do not match the commit range::release-drafter rendered a different set of pull requests than the range contains. Expected minus rendered shown below."
+            cat prs.diff
+            {
+              echo "### PR set mismatch"
+              echo
+              echo '```diff'
+              cat prs.diff
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          echo "Verified: $(grep -c . expected_prs.txt || true) pull requests, notes match the range."
+
+      - name: Create or update the release
+        id: release
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREV_TAG: ${{ steps.range.outputs.prev_tag }}
+          MODE: ${{ inputs.mode }}
+          DEPLOY_SUMMARY: ${{ steps.gate.outputs.deploy_summary }}
+          BODY: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREV_TAG}" ]; then
+            COMPARE="https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
+          else
+            COMPARE="https://github.com/${REPO}/commits/${TAG}"
+          fi
+
+          # The header and compare link are built here, not in the config: only
+          # this job knows the deployed SHA and the deploy runs, and
+          # $RESOLVED_VERSION is the prefix-stripped version, not the tag.
+          {
+            echo "Production deploy of \`${SHA}\`."
+            echo
+            printf '%s' "${DEPLOY_SUMMARY}"
+            echo
+            printf '%s\n' "${BODY}"
+            echo
+            echo "**Full changelog:** ${COMPARE}"
+          } > release_body.md
+
+          # The machine-readable payload carries ONLY customer-facing work.
+          # Internal and security lines stay in the prose body, so a downstream
+          # marketing consumer cannot leak them by reading the wrong section.
+          jq \
+            --arg tag "${TAG}" \
+            --arg sha "${SHA}" \
+            --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg compare_url "${COMPARE}" \
+            '{
+              tag: $tag,
+              sha: $sha,
+              deployed_at: $deployed_at,
+              compare_url: $compare_url,
+              categories: {
+                new:      [.[] | select(.labels | index("release/new"))      | {title: .title, pr: .number}],
+                improved: [.[] | select(.labels | index("release/improved")) | {title: .title, pr: .number}],
+                fixed:    [.[] | select(.labels | index("release/fixed"))    | {title: .title, pr: .number}],
+                api:      [.[] | select(.labels | index("release/api"))      | {title: .title, pr: .number}]
+              }
+            }' prs.json > release.json
+
+          if [ "${MODE}" = "dry-run" ]; then
+            {
+              echo "### Release body (dry-run — nothing was written)"
+              echo
+              cat release_body.md
+              echo
+              echo "### release.json"
+              echo
+              echo '```json'
+              cat release.json
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "[dry-run] would publish ${TAG} at ${SHA}"
+            exit 0
+          fi
+
+          CREATE_ARGS=()
+          if [ "${MODE}" = "draft" ]; then
+            CREATE_ARGS+=(--draft)
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; updating in place."
+            gh release edit "${TAG}" --title "${TAG}" --notes-file release_body.md
+          else
+            gh release create "${TAG}" --title "${TAG}" --notes-file release_body.md --target "${SHA}" "${CREATE_ARGS[@]}"
+          fi
+
+          gh release upload "${TAG}" release.json --clobber
+
+          # The release exists by this point. A cosmetic summary line must not
+          # be able to fail the step and open a failure issue for a release
+          # that actually succeeded.
+          {
+            echo "### Released ${TAG}"
+            gh release view "${TAG}" --json url --jq '.url' || echo "(release URL unavailable)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          MODE: ${{ inputs.mode }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Production release failed"
+            echo
+            echo "- **Production SHA:** \`${SHA:-not resolved}\`"
+            echo "- **Tag:** \`${TAG:-not resolved}\`"
+            echo "- **Mode:** \`${MODE}\`"
+            echo "- **Run:** ${RUN_URL}"
+            echo
+            echo "Common causes:"
+            echo
+            echo "- **PR set mismatch** — release-drafter rendered a different set of pull requests than the range contains. Check its truncation limits before trusting the notes."
+            echo "- **Tag conflict** — the tag already points at another commit. Release tags are immutable; do not force. This usually means history was rewritten."
+            echo "- **Range too large** — raise \`max_commits\` deliberately, or release a smaller range."
+            echo
+            echo "Re-run with the explicit SHA once fixed. The workflow is idempotent: an existing tag is reused and an existing release is edited in place."
+          } > issue_body.md
+
+          gh issue create \
+            --repo "${REPO}" \
+            --title "Production release failed ($(date -u +%Y-%m-%d))" \
+            --label release-automation \
+            --body-file issue_body.md
