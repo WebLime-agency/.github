@@ -39,12 +39,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! command -v python3 >/dev/null 2>&1; then
-            echo "::error title=Missing python3::python3 is required for the AF_UNIX notify shim; no fallback client is attempted."
+          if [ ! -x /usr/bin/python3 ]; then
+            echo "::error title=Missing trusted python3::The trusted /usr/bin/python3 interpreter is required; no PATH lookup or fallback client is attempted."
             exit 1
           fi
 
-          python3 <<'PY'
+          if ! PYTHON_METADATA="$(/usr/bin/stat -Lc '%u %a' /usr/bin/python3 2>/dev/null)"; then
+            echo "::error title=Python3 metadata failure::Unable to verify ownership and permissions for /usr/bin/python3."
+            exit 1
+          fi
+          read -r PYTHON_OWNER PYTHON_MODE <<< "$PYTHON_METADATA"
+          if [ "$PYTHON_OWNER" != "0" ]; then
+            echo "::error title=Untrusted python3 owner::The trusted /usr/bin/python3 interpreter must be root-owned."
+            exit 1
+          fi
+          if [[ ! "$PYTHON_MODE" =~ ^[0-7]{3,4}$ ]] || (( (8#$PYTHON_MODE & 0022) != 0 )); then
+            echo "::error title=Unsafe python3 permissions::The trusted /usr/bin/python3 interpreter must not be group- or world-writable."
+            exit 1
+          fi
+
+          /usr/bin/python3 <<'PY'
           import json
           import os
           import socket

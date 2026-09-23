@@ -8,6 +8,7 @@ TMP_ROOT=${TMPDIR:-/tmp}/vercel-preview-spool-test.$$
 STEPS_DIR="$TMP_ROOT/steps"
 STUB_DIR="$TMP_ROOT/bin"
 REAL_PYTHON=$(command -v python3 || true)
+PATH_SHADOW_MARKER="$TMP_ROOT/path-shadow-python3-ran"
 
 pass_count=0
 
@@ -103,6 +104,15 @@ echo "gh should not be invoked by the notify shim" >&2
 exit 2
 STUB
   chmod +x "$STUB_DIR/gh"
+
+  cat > "$STUB_DIR/python3" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${PATH_SHADOW_MARKER:?}"
+printf 'executed\n' > "$PATH_SHADOW_MARKER"
+exit 97
+STUB
+  chmod +x "$STUB_DIR/python3"
 }
 
 set_common_env() {
@@ -116,6 +126,7 @@ set_common_env() {
   export BROKER_SOCKET_PATH="$socket_path"
   export POINTER_REPOSITORY="WebLime-agency/example"
   export POINTER_RUN_ID=12345
+  export PATH_SHADOW_MARKER
 
   mkdir -p "$runner_temp"
 }
@@ -462,26 +473,80 @@ test_broker_pointer_is_documented_as_untrusted() {
   pass "notify workflow documents independent broker re-verification"
 }
 
-test_python3_preflight_fail_closed() {
+test_absolute_python_ignores_path_shadow() {
+  rm -f "$PATH_SHADOW_MARKER"
+  run_server_case "path-shadow" "$(complete_ack_actions "$(accepted_ack)")" success
+  if [ -e "$PATH_SHADOW_MARKER" ]; then
+    fail "trusted notify step executed PATH-shadowed python3"
+  fi
+  pass "trusted notify step ignores PATH-shadowed python3"
+}
+
+test_python3_preflight_fails_closed() {
   local runner_temp="$TMP_ROOT/runner-preflight"
   local out_file="$TMP_ROOT/preflight.out"
-  local empty_path="$TMP_ROOT/no-python"
+  local missing_step="$STEPS_DIR/notify-missing-python3.sh"
+  local untrusted_step="$STEPS_DIR/notify-untrusted-python3.sh"
+  local unsafe_mode_step="$STEPS_DIR/notify-unsafe-python3-mode.sh"
+  local untrusted_python="$TMP_ROOT/untrusted-python3"
+  local unsafe_stat="$TMP_ROOT/unsafe-stat"
   local status
-  mkdir -p "$empty_path"
 
+  sed 's|/usr/bin/python3|/definitely/missing/python3|g' "$STEPS_DIR/notify-vercel-preview-broker.sh" > "$missing_step"
   set_common_env "$runner_temp" "$TMP_ROOT/preflight.sock"
   set +e
-  PATH="$empty_path" "$BASH" --noprofile --norc -e -o pipefail "$STEPS_DIR/notify-vercel-preview-broker.sh" >"$out_file" 2>&1
+  "$BASH" --noprofile --norc -e -o pipefail "$missing_step" >"$out_file" 2>&1
   status=$?
   set -e
   if [ "$status" -eq 0 ]; then
-    fail "missing python3 should fail closed"
+    fail "missing trusted python3 should fail closed"
   fi
-  assert_file_contains "$out_file" "::error title=Missing python3::"
+  assert_file_contains "$out_file" "::error title=Missing trusted python3::"
   if [ -e "$TMP_ROOT/preflight.sock" ]; then
     fail "preflight should not create or connect a socket"
   fi
-  pass "python3 preflight fails closed without fallback"
+
+  cat > "$untrusted_python" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${PATH_SHADOW_MARKER:?}"
+printf 'executed\n' > "$PATH_SHADOW_MARKER"
+exit 97
+STUB
+  chmod +x "$untrusted_python"
+  sed "s|/usr/bin/python3|$untrusted_python|g" "$STEPS_DIR/notify-vercel-preview-broker.sh" > "$untrusted_step"
+  rm -f "$PATH_SHADOW_MARKER"
+  set +e
+  "$BASH" --noprofile --norc -e -o pipefail "$untrusted_step" >"$out_file" 2>&1
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "non-root-owned python3 should fail closed"
+  fi
+  assert_file_contains "$out_file" "::error title=Untrusted python3 owner::"
+  if [ -e "$PATH_SHADOW_MARKER" ]; then
+    fail "preflight executed non-root-owned python3"
+  fi
+
+  cat > "$unsafe_stat" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '0 777\n'
+STUB
+  chmod +x "$unsafe_stat"
+  sed "s|/usr/bin/stat|$unsafe_stat|g" "$STEPS_DIR/notify-vercel-preview-broker.sh" > "$unsafe_mode_step"
+  set +e
+  "$BASH" --noprofile --norc -e -o pipefail "$unsafe_mode_step" >"$out_file" 2>&1
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "group/world-writable python3 should fail closed"
+  fi
+  assert_file_contains "$out_file" "::error title=Unsafe python3 permissions::"
+  if [ -e "$PATH_SHADOW_MARKER" ]; then
+    fail "preflight executed python3 with unsafe permissions"
+  fi
+  pass "python3 preflight rejects missing, non-root-owned, and writable interpreters"
 }
 
 test_exact_request_and_accepted_success() {
@@ -623,7 +688,7 @@ test_complete_malformed_duplicate_key_and_overcap_fail_terminal() {
     fi
   done
 
-  ack=$(python3 - <<'PY'
+  ack=$("$REAL_PYTHON" - <<'PY'
 print("x" * 1025)
 PY
 )
@@ -682,7 +747,7 @@ test_request_guards_fail_before_send() {
         expected_title="Invalid pointer run_id"
         ;;
       oversized-repository)
-        oversized_repository=$(python3 - <<'PY'
+        oversized_repository=$("$REAL_PYTHON" - <<'PY'
 print("x" * 5000)
 PY
 )
@@ -744,7 +809,14 @@ test_token_output_isolation_static() {
 }
 
 test_inline_client_and_no_helper_static() {
-  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "python3 <<'PY'"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "/usr/bin/python3 <<'PY'"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "/usr/bin/stat"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "Untrusted python3 owner"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "Unsafe python3 permissions"
+  assert_file_not_contains "$DEPLOY_WORKFLOW_FILE" "command -v python3"
+  if grep -Eq '^[[:space:]]*(python3|stat|curl|socat|nc|jq)([[:space:]]|$)' "$STEPS_DIR/notify-vercel-preview-broker.sh"; then
+    fail "trusted notify step contains a bare-name external executable"
+  fi
   assert_file_contains "$DEPLOY_WORKFLOW_FILE" "object_pairs_hook=reject_duplicate_pairs"
   assert_file_not_contains "$DEPLOY_WORKFLOW_FILE" "socat"
   assert_file_not_contains "$DEPLOY_WORKFLOW_FILE" "nc "
@@ -800,7 +872,8 @@ main() {
   test_stage1_handoff_stripped_static
   test_pr_build_has_no_persisted_token_or_blanket_vars
   test_broker_pointer_is_documented_as_untrusted
-  test_python3_preflight_fail_closed
+  test_absolute_python_ignores_path_shadow
+  test_python3_preflight_fails_closed
   test_exact_request_and_accepted_success
   test_duplicate_success_transport_only
   test_tagged_union_violations_fail_closed
