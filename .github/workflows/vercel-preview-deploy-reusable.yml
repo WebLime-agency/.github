@@ -26,6 +26,8 @@ jobs:
     name: Notify Vercel preview broker
     # This is a noise-reduction gate only. The broker owns the authoritative
     # trust check for repository, run, event, conclusion, PR, and head revision.
+    # The pointer grants no authority: the broker independently re-verifies the
+    # GitHub run, workflow identity, head SHA, repository, and default branch.
     if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.repository.full_name == github.repository && github.event.workflow_run.name == inputs.expected_build_workflow_name
     runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:

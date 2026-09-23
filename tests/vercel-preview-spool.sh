@@ -419,6 +419,49 @@ test_stage1_handoff_stripped_static() {
   pass "stage 1 keeps build check and removes artifact handoff"
 }
 
+test_pr_build_has_no_persisted_token_or_blanket_vars() {
+  assert_file_contains "$BUILD_WORKFLOW_FILE" "persist-credentials: false"
+  assert_file_contains "$BUILD_WORKFLOW_FILE" "permissions:"
+  assert_file_contains "$BUILD_WORKFLOW_FILE" "contents: read"
+  assert_file_not_contains "$BUILD_WORKFLOW_FILE" 'toJSON(vars)'
+  assert_file_not_contains "$BUILD_WORKFLOW_FILE" "VARS_JSON"
+  assert_file_not_contains "$BUILD_WORKFLOW_FILE" "Object.entries(vars)"
+  assert_file_not_contains "$BUILD_WORKFLOW_FILE" "VERCEL_PREVIEW_BROKER_SOCKET_PATH"
+  assert_file_not_contains "$BUILD_WORKFLOW_FILE" "BROKER_SOCKET_PATH"
+  "$REAL_PYTHON" - "$BUILD_WORKFLOW_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+actual = set(re.findall(r"\$\{\{\s*vars\.([A-Z0-9_]+)\s*\}\}", workflow))
+expected = {
+    "PUBLIC_APP_ORIGIN",
+    "PUBLIC_APP_URL",
+    "PUBLIC_E2E_VISUAL_TEST",
+    "PUBLIC_SHORTLINK_ORIGIN",
+    "PUBLIC_STRIPE_PRODUCTION",
+    "PUBLIC_SUPABASE_ANON_KEY",
+    "PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    "PUBLIC_SUPABASE_URL",
+}
+if actual != expected:
+    raise SystemExit(
+        f"build variable allowlist changed: missing={sorted(expected - actual)}, "
+        f"unexpected={sorted(actual - expected)}"
+    )
+PY
+  pass "PR build persists no checkout token and receives no blanket variable context"
+}
+
+test_broker_pointer_is_documented_as_untrusted() {
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "pointer grants no authority"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "workflow identity"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "head SHA"
+  assert_file_contains "$DEPLOY_WORKFLOW_FILE" "default branch"
+  pass "notify workflow documents independent broker re-verification"
+}
+
 test_python3_preflight_fail_closed() {
   local runner_temp="$TMP_ROOT/runner-preflight"
   local out_file="$TMP_ROOT/preflight.out"
@@ -755,6 +798,8 @@ main() {
   extract_steps
 
   test_stage1_handoff_stripped_static
+  test_pr_build_has_no_persisted_token_or_blanket_vars
+  test_broker_pointer_is_documented_as_untrusted
   test_python3_preflight_fail_closed
   test_exact_request_and_accepted_success
   test_duplicate_success_transport_only

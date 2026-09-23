@@ -34,6 +34,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -45,19 +46,41 @@ jobs:
 
       - name: Inject repo/org Variables into build env
         env:
-          VARS_JSON: ${{ toJSON(vars) }}
+          PUBLIC_APP_ORIGIN: ${{ vars.PUBLIC_APP_ORIGIN }}
+          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+          PUBLIC_E2E_VISUAL_TEST: ${{ vars.PUBLIC_E2E_VISUAL_TEST }}
+          PUBLIC_SHORTLINK_ORIGIN: ${{ vars.PUBLIC_SHORTLINK_ORIGIN }}
+          PUBLIC_STRIPE_PRODUCTION: ${{ vars.PUBLIC_STRIPE_PRODUCTION }}
+          PUBLIC_SUPABASE_ANON_KEY: ${{ vars.PUBLIC_SUPABASE_ANON_KEY }}
+          PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ vars.PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+          PUBLIC_SUPABASE_URL: ${{ vars.PUBLIC_SUPABASE_URL }}
         run: |
           set -euo pipefail
-          # Repo-agnostic: export every repository/organization Variable (non-secret
-          # config, including each repo's own PUBLIC_* build vars) into the build
-          # environment. Secrets are NOT part of the `vars` context, so the build
-          # stays tokenless. Values are read from an env var (never interpolated into
-          # the shell) and single-line config values are expected.
+          # Only this reviewed, build-safe allowlist reaches PR-controlled build code.
+          # All other repository and organization configuration stays out of the job.
           node -e '
+            const crypto = require("crypto");
             const fs = require("fs");
-            const vars = JSON.parse(process.env.VARS_JSON || "{}");
-            const lines = Object.entries(vars).map(([k, v]) => `${k}=${v}`);
-            if (lines.length) fs.appendFileSync(process.env.GITHUB_ENV, lines.join("\n") + "\n");
+            const allowlist = [
+              "PUBLIC_APP_ORIGIN",
+              "PUBLIC_APP_URL",
+              "PUBLIC_E2E_VISUAL_TEST",
+              "PUBLIC_SHORTLINK_ORIGIN",
+              "PUBLIC_STRIPE_PRODUCTION",
+              "PUBLIC_SUPABASE_ANON_KEY",
+              "PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+              "PUBLIC_SUPABASE_URL",
+            ];
+            const entries = [];
+            for (const name of allowlist) {
+              const value = process.env[name];
+              if (!value) continue;
+              let delimiter;
+              do delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+              while (value.includes(delimiter));
+              entries.push(`${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+            }
+            if (entries.length) fs.appendFileSync(process.env.GITHUB_ENV, entries.join(""));
           '
 
       - name: Build Vercel output
