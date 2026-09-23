@@ -153,6 +153,13 @@ if [ "$1" = "release" ]; then
   exit 0
 fi
 
+if [ "$1" = "label" ]; then
+  if [ "${STUB_LABEL_EXISTS:-true}" = "true" ]; then
+    echo "release-automation"
+  fi
+  exit 0
+fi
+
 if [ "$1" = "issue" ]; then
   echo "$*" >> "${GH_ISSUE_LOG:-/dev/null}"
   exit 0
@@ -220,6 +227,7 @@ extract_step "Compute release range" "$STEPS_DIR/range.sh"
 extract_step "Resolve and create the release tag" "$STEPS_DIR/tag.sh"
 extract_step "Verify the notes cover the whole range" "$STEPS_DIR/verify.sh"
 extract_step "Create or update the release" "$STEPS_DIR/release.sh"
+extract_step "Report failure" "$STEPS_DIR/notify.sh"
 
 TIP=1111111111111111111111111111111111111111
 OTHER=2222222222222222222222222222222222222222
@@ -466,16 +474,42 @@ if ! bash "$LABEL_SCRIPT" --dry-run acme/app > "$TMP_ROOT/labels-dryrun.log" 2>&
   cat "$TMP_ROOT/labels-dryrun.log" >&2
   fail "label sync dry-run should succeed"
 fi
-assert_file_contains "$TMP_ROOT/labels-dryrun.log" "Syncing 7 release labels"
-pass "label sync lists all seven labels in dry-run and writes nothing"
+for L in release/new release/improved release/fixed release/api release/security release/internal release/skip release-automation; do
+  assert_file_contains "$TMP_ROOT/labels-dryrun.log" "$L"
+done
+assert_file_contains "$TMP_ROOT/labels-dryrun.log" "Done."
+pass "label sync lists every label in dry-run and writes nothing"
 
 while IFS='|' read -r name _ description; do
   [ -n "$name" ] || continue
   if [ "${#description}" -gt 100 ]; then
     fail "label description for $name is ${#description} characters; GitHub allows 100"
   fi
-done < <(sed -n "s/^  '\(release\/[a-z]*\)|\([0-9a-f]*\)|\(.*\)'$/||/p" "$LABEL_SCRIPT")
+done < <(sed -n "s/^  '\(release[/-][a-z-]*\)|\([0-9a-f]*\)|\(.*\)'$/||/p" "$LABEL_SCRIPT")
 pass "every label description fits GitHub's 100 character limit"
+
+# -------------------------------------------------------------- notify -----
+
+# The gate reads deploy run conclusions, which needs `actions: read`. Without
+# it every run dies with HTTP 403 before it can tell pending from successful.
+PERMS=$(awk '/^permissions:/{f=1;next} /^[a-z]/{f=0} f' "$WORKFLOW_FILE")
+printf '%s' "$PERMS" | grep -q 'actions: read'   || fail "the workflow must declare actions: read, or the gate cannot list deploy runs"
+pass "the workflow requests actions: read for the gate's run lookups"
+
+ISSUE_LOG="$TMP_ROOT/gh-issue.log"
+: > "$ISSUE_LOG"
+run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-labelled.log"   "GH_ISSUE_LOG=$ISSUE_LOG" "GH_RELEASE_LOG=$TMP_ROOT/unused.log"   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish"   "RUN_URL=https://github.invalid/run/1"
+assert_file_contains "$ISSUE_LOG" "--label release-automation"
+pass "a failure opens a labelled release-automation issue"
+
+# An absent label must not swallow the alert: gh validates labels before
+# creating anything, so this would otherwise mean no issue at all.
+: > "$ISSUE_LOG"
+run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-unlabelled.log"   "GH_ISSUE_LOG=$ISSUE_LOG" "GH_RELEASE_LOG=$TMP_ROOT/unused.log"   "STUB_LABEL_EXISTS=false"   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish"   "RUN_URL=https://github.invalid/run/1"
+assert_file_contains "$ISSUE_LOG" "issue create"
+assert_file_not_contains "$ISSUE_LOG" "--label"
+assert_file_contains "$TMP_ROOT/notify-unlabelled.log" "Missing label"
+pass "a missing release-automation label still opens the alert, unlabelled"
 
 echo
 echo "All $pass_count checks passed."

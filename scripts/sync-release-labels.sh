@@ -65,6 +65,7 @@ LABELS=(
   'release/security|d93f0b|Security and reliability. In the notes, not the marketing payload. Never an exploitable title.'
   'release/internal|6a737d|Internal only. Collapsed in the release notes, excluded from marketing input.'
   'release/skip|c5def5|Excluded from release notes entirely.'
+  'release-automation|ededed|Opened by the release workflow when a production release fails.'
 )
 
 # GitHub caps label descriptions at 100 characters and rejects the request with

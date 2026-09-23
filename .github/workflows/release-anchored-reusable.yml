@@ -57,6 +57,9 @@ on:
 
 permissions:
   contents: write
+  # Required to read the deploy workflows' run conclusions. Without it the
+  # gate gets HTTP 403 and cannot tell a pending deploy from a successful one.
+  actions: read
   pull-requests: read
   issues: write
 
@@ -466,8 +469,19 @@ jobs:
             echo "Re-run with the explicit SHA once fixed. The workflow is idempotent: an existing tag is reused and an existing release is edited in place."
           } > issue_body.md
 
+          # The alert must not fail because its own label is missing. gh
+          # validates labels before creating anything, so an absent label means
+          # no issue at all — at exactly the moment one is most needed.
+          LABEL_ARGS=()
+          if gh label list --repo "${REPO}" --search release-automation --json name --jq '.[].name' \
+            | grep -qx 'release-automation'; then
+            LABEL_ARGS+=(--label release-automation)
+          else
+            echo "::warning title=Missing label::release-automation does not exist in ${REPO}; opening the alert unlabelled. Run scripts/sync-release-labels.sh."
+          fi
+
           gh issue create \
             --repo "${REPO}" \
             --title "Production release failed ($(date -u +%Y-%m-%d))" \
-            --label release-automation \
-            --body-file issue_body.md
+            --body-file issue_body.md \
+            "${LABEL_ARGS[@]}"
