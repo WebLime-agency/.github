@@ -1,0 +1,556 @@
+name: Vercel Staging Deploy (reusable)
+
+# Central reusable workflow - lives in WebLime-agency/.github.
+# Trusted staging path for governed dev releases. This workflow is artifact-free
+# and runs on the long-lived shared weblime-ci runner. A1/A2 hardening reduces
+# runner risk, but true host isolation is still tracked by:
+# https://github.com/eba8/mission-control/issues/413
+#
+# Operator preconditions:
+# - Provision /opt/weblime/vercel/56.3.1/vercel from vercel@56.3.1 dist/vc.js,
+#   root-owned, not group/world-writable, immutable where feasible.
+# - Keep the consumer repo's staging environment secret VERCEL_TOKEN dedicated
+#   to staging, team-scoped for WebLime Vercel, and distinct from production.
+# - Own rotation/revocation and the manual recovery runbook for post-promotion
+#   smoke failures. The per-repo alias allowlist below is the authorization
+#   boundary against production-alias selection.
+
+on:
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: "Exact reviewed dev SHA to deploy to staging."
+        required: true
+        type: string
+      node_version_file:
+        description: "Path to the Node.js version file."
+        required: false
+        type: string
+        default: .node-version
+      vercel_cli_version:
+        description: "Pinned operator-provisioned Vercel CLI version to verify."
+        required: false
+        type: string
+        default: 56.3.1
+    outputs:
+      deployment_url:
+        description: "Immutable candidate Vercel deployment URL."
+        value: ${{ jobs.deploy-staging.outputs.deployment_url }}
+      promoted_aliases:
+        description: "Comma-joined aliases promoted to the candidate."
+        value: ${{ jobs.deploy-staging.outputs.promoted_aliases }}
+      result:
+        description: "success, superseded, failed, rolled_back, or rollback_failed."
+        value: ${{ jobs.deploy-staging.outputs.result }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vercel-staging-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Deploy staging to Vercel
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
+    environment: staging
+    outputs:
+      deployment_url: ${{ steps.finalize.outputs.deployment_url }}
+      promoted_aliases: ${{ steps.finalize.outputs.promoted_aliases }}
+      result: ${{ steps.finalize.outputs.result }}
+    steps:
+      - name: Preflight trusted tools
+        id: tools
+        env:
+          EXPECTED_VERCEL_CLI_VERSION: ${{ inputs.vercel_cli_version }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED_PINNED_VERSION="56.3.1"
+          EXPECTED_VERCEL_CLI_PATH="/opt/weblime/vercel/56.3.1/vercel"
+          EXPECTED_VERCEL_CLI_SHA256="c0e8cfad56746ea7a496604fc8b1e9ef71624d1784f07415a41777bdddb2536f"
+
+          if [ "$EXPECTED_VERCEL_CLI_VERSION" != "$EXPECTED_PINNED_VERSION" ]; then
+            echo "::error title=Unsupported Vercel CLI version::This reusable is reviewed only for Vercel CLI $EXPECTED_PINNED_VERSION."
+            exit 1
+          fi
+
+          require_abs_tool() {
+            local name=$1
+            local path=$2
+
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name path::$name must resolve to an absolute path." >&2
+                exit 1
+                ;;
+            esac
+
+            if [ ! -x "$path" ]; then
+              echo "::error title=Missing trusted $name::$path is not executable." >&2
+              exit 1
+            fi
+
+            local current=$path
+            while :; do
+              local metadata owner mode
+              if ! metadata="$(/usr/bin/stat -Lc '%u %a' "$current" 2>/dev/null)"; then
+                echo "::error title=$name metadata failure::Unable to verify ownership and permissions for $current." >&2
+                exit 1
+              fi
+              read -r owner mode <<< "$metadata"
+              if [ "$owner" != "0" ]; then
+                echo "::error title=Untrusted $name owner::$current must be root-owned." >&2
+                exit 1
+              fi
+              if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+                echo "::error title=Unsafe $name permissions::$current must not be group- or world-writable." >&2
+                exit 1
+              fi
+              [ "$current" = "/" ] && break
+              current=${current%/*}
+              [ -z "$current" ] && current="/"
+            done
+          }
+
+          resolve_path_tool() {
+            local name=$1
+            local path
+            if ! path="$(command -v "$name" 2>/dev/null)"; then
+              echo "::error title=Missing trusted $name::Unable to resolve $name on PATH for preflight." >&2
+              exit 1
+            fi
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name resolution::$name resolved to non-file command '$path'." >&2
+                exit 1
+                ;;
+            esac
+            require_abs_tool "$name" "$path"
+            printf '%s\n' "$path"
+          }
+
+          require_abs_tool "stat" "/usr/bin/stat"
+          require_abs_tool "sha256sum" "/usr/bin/sha256sum"
+
+          GIT_BIN="$(resolve_path_tool git)"
+          CURL_BIN="$(resolve_path_tool curl)"
+          JQ_BIN="$(resolve_path_tool jq)"
+          PYTHON_BIN="/usr/bin/python3"
+          require_abs_tool "python3" "$PYTHON_BIN"
+          require_abs_tool "vercel" "$EXPECTED_VERCEL_CLI_PATH"
+
+          VERCEL_VERSION_OUTPUT="$("$EXPECTED_VERCEL_CLI_PATH" --version 2>/dev/null || true)"
+          VERCEL_VERSION_LINE=""
+          while IFS= read -r version_line; do
+            version_line=${version_line%$'\r'}
+            if [ -n "$version_line" ]; then
+              VERCEL_VERSION_LINE=$version_line
+            fi
+          done <<< "$VERCEL_VERSION_OUTPUT"
+          if [ "$VERCEL_VERSION_LINE" != "$EXPECTED_VERCEL_CLI_VERSION" ] && [ "$VERCEL_VERSION_LINE" != "Vercel CLI $EXPECTED_VERCEL_CLI_VERSION" ]; then
+            echo "::error title=Vercel CLI version mismatch::Expected $EXPECTED_VERCEL_CLI_VERSION from the operator-provisioned CLI."
+            exit 1
+          fi
+
+          read -r ACTUAL_VERCEL_CLI_SHA256 _ < <(/usr/bin/sha256sum "$EXPECTED_VERCEL_CLI_PATH")
+          if [ "$ACTUAL_VERCEL_CLI_SHA256" != "$EXPECTED_VERCEL_CLI_SHA256" ]; then
+            echo "::error title=Vercel CLI hash mismatch::The operator-provisioned CLI hash does not match the reviewed vercel@$EXPECTED_PINNED_VERSION binary."
+            exit 1
+          fi
+
+          {
+            echo "git=$GIT_BIN"
+            echo "curl=$CURL_BIN"
+            echo "jq=$JQ_BIN"
+            echo "python=$PYTHON_BIN"
+            echo "vercel=$EXPECTED_VERCEL_CLI_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact staging source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_sha }}
+          fetch-depth: 0
+          clean: true
+          persist-credentials: false
+          path: src-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify exact source
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GIT_BIN: ${{ steps.tools.outputs.git }}
+        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$EXPECTED_SHA" ]; then
+            echo "::error title=Missing expected SHA::expected_sha is required."
+            exit 1
+          fi
+
+          ACTUAL_SHA="$("$GIT_BIN" rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error title=Unexpected checkout SHA::Checked out $ACTUAL_SHA, expected $EXPECTED_SHA."
+            exit 1
+          fi
+
+          if [ -n "$("$GIT_BIN" status --porcelain)" ]; then
+            echo "::error title=Dirty checkout::The isolated staging checkout is not clean."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: src-${{ github.run_id }}-${{ github.run_attempt }}/${{ inputs.node_version_file }}
+
+      - name: Build Vercel staging output
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+          VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          PUBLIC_SUPABASE_URL: ${{ vars.PUBLIC_SUPABASE_URL }}
+          PUBLIC_SUPABASE_ANON_KEY: ${{ vars.PUBLIC_SUPABASE_ANON_KEY }}
+          PUBLIC_SITE_URL: ${{ vars.PUBLIC_SITE_URL }}
+          PUBLIC_APP_ENV: ${{ vars.PUBLIC_APP_ENV }}
+          PUBLIC_TURNSTILE_SITE_KEY: ${{ vars.PUBLIC_TURNSTILE_SITE_KEY }}
+        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          missing=false
+          for required_name in VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!required_name:-}" ]; then
+              echo "::error title=Missing Vercel project variable::$required_name must be configured as a non-secret repository or organization Variable."
+              missing=true
+            fi
+          done
+          if [ "$missing" = "true" ]; then
+            exit 1
+          fi
+
+          "$VERCEL_BIN" build
+
+          if [ ! -d .vercel/output ] || [ ! -f .vercel/output/config.json ]; then
+            echo "::error title=Missing Vercel output::vercel build did not create .vercel/output/config.json."
+            exit 1
+          fi
+
+      - name: Prepare staging aliases
+        id: prep
+        env:
+          GIT_BIN: ${{ steps.tools.outputs.git }}
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          "$GIT_BIN" fetch --quiet origin dev
+          ORIGIN_DEV_SHA="$("$GIT_BIN" rev-parse refs/remotes/origin/dev)"
+
+          case "$GITHUB_REPOSITORY_NAME" in
+            WebLime-agency/limey-web-app)
+              ALIASES="pythonlife.org,staging.lm.fm"
+              ;;
+            *)
+              echo "::error title=Unsupported staging repository::No staging alias allowlist exists for $GITHUB_REPOSITORY_NAME."
+              exit 1
+              ;;
+          esac
+
+          IFS=',' read -r -a alias_array <<< "$ALIASES"
+          for alias in "${alias_array[@]}"; do
+            case "$alias" in
+              pythonlife.org|staging.lm.fm) ;;
+              lm.fm|www.lm.fm|limey.app|www.limey.app|production.*|www.production.*)
+                echo "::error title=Production domain refused::The staging reusable refuses to promote production alias $alias."
+                exit 1
+                ;;
+              *)
+                echo "::error title=Unreviewed staging alias::Alias $alias is not in the reviewed staging allowlist."
+                exit 1
+                ;;
+            esac
+          done
+
+          {
+            echo "origin_dev_sha=$ORIGIN_DEV_SHA"
+            echo "aliases=$ALIASES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Vercel control-plane deploy/promote
+        id: control
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ORIGIN_DEV_SHA: ${{ steps.prep.outputs.origin_dev_sha }}
+          STAGING_ALIASES: ${{ steps.prep.outputs.aliases }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+          JQ_BIN: ${{ steps.tools.outputs.jq }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          promoted_aliases=()
+          rollback_prefix="${NEUTRAL_DIR}/vercel-staging-rollback-${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
+
+          write_output() {
+            local key=$1
+            local value=$2
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
+          }
+
+          set_result() {
+            local result=$1
+            local aliases_csv=""
+            if [ "${#promoted_aliases[@]}" -gt 0 ]; then
+              local IFS=,
+              aliases_csv="${promoted_aliases[*]}"
+            fi
+            write_output "result" "$result"
+            write_output "deployment_url" "${deployment_url:-}"
+            write_output "promoted_aliases" "$aliases_csv"
+          }
+
+          run_python() {
+            (
+              cd "$NEUTRAL_DIR"
+              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$@"
+            )
+          }
+
+          parse_deploy_url() {
+            local text=$1
+            run_python "$text" <<'PY'
+          import re
+          import sys
+          text = sys.argv[1]
+          match = re.search(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+\.vercel\.app[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*", text)
+          if not match:
+              raise SystemExit("missing Vercel deployment URL")
+          print(match.group(0).rstrip(".,)"))
+          PY
+          }
+
+          extract_ready_state() {
+            "$JQ_BIN" -er '
+              if type != "object" then empty
+              else .readyState // .deployment.readyState // .state // empty
+              end
+            '
+          }
+
+          extract_target_url() {
+            "$JQ_BIN" -er '
+              def walk_strings:
+                if type == "string" then .
+                elif type == "array" then .[] | walk_strings
+                elif type == "object" then .[] | walk_strings
+                else empty end;
+              [walk_strings | select(test("(^https://|^)[A-Za-z0-9.-]+\\.vercel\\.app(/)?$"))][0] // empty
+            '
+          }
+
+          inspect_json() {
+            local target=$1
+            "$VERCEL_BIN" inspect "$target" --wait --token="$VERCEL_TOKEN" --json
+          }
+
+          verify_ready() {
+            local target=$1
+            local payload ready_state
+            if ! payload="$(inspect_json "$target")"; then
+              echo "::error title=Vercel inspect failed::Unable to inspect $target."
+              return 1
+            fi
+            if ! ready_state="$(printf '%s\n' "$payload" | extract_ready_state)"; then
+              echo "::error title=Malformed Vercel inspect output::readyState was missing for $target."
+              return 1
+            fi
+            if [ "$ready_state" != "READY" ]; then
+              echo "::error title=Vercel deployment not ready::$target readyState was $ready_state."
+              return 1
+            fi
+          }
+
+          current_alias_target() {
+            local alias=$1
+            local payload target
+            if ! payload="$(inspect_json "https://${alias}")"; then
+              return 1
+            fi
+            if ! target="$(printf '%s\n' "$payload" | extract_target_url)"; then
+              return 1
+            fi
+            case "$target" in
+              https://*) printf '%s\n' "$target" ;;
+              *) printf 'https://%s\n' "$target" ;;
+            esac
+          }
+
+          verify_alias_points_to_candidate() {
+            local alias=$1
+            local target
+            if ! target="$(current_alias_target "$alias")"; then
+              echo "::error title=Alias verification failed::Unable to verify $alias after promotion."
+              return 1
+            fi
+            if [ "$target" != "$deployment_url" ]; then
+              echo "::error title=Alias verification mismatch::$alias does not resolve to the candidate deployment."
+              return 1
+            fi
+          }
+
+          rollback_aliases() {
+            local rollback_failed=false
+            local alias target
+            IFS=',' read -r -a rollback_aliases_array <<< "$STAGING_ALIASES"
+            for alias in "${rollback_aliases_array[@]}"; do
+              if [ ! -s "$rollback_prefix-$alias.target" ]; then
+                echo "::error title=Rollback target missing::No captured rollback target for $alias."
+                rollback_failed=true
+                continue
+              fi
+              IFS= read -r target < "$rollback_prefix-$alias.target"
+              if ! "$VERCEL_BIN" alias set "$target" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+                echo "::error title=Rollback alias set failed::Failed to restore $alias."
+                rollback_failed=true
+                continue
+              fi
+              local restored
+              if ! restored="$(current_alias_target "$alias")" || [ "$restored" != "$target" ]; then
+                echo "::error title=Rollback verification failed::$alias did not resolve to its captured target."
+                rollback_failed=true
+              fi
+            done
+
+            if [ "$rollback_failed" = "true" ]; then
+              set_result "rollback_failed"
+              return 1
+            fi
+            set_result "rolled_back"
+            return 0
+          }
+
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "::error title=Missing staging Vercel token::Configure VERCEL_TOKEN in the consumer repository staging environment."
+            set_result "failed"
+            exit 0
+          fi
+          if [ -z "$STAGING_ALIASES" ]; then
+            echo "::error title=Missing staging aliases::The token step received an empty staging alias allowlist."
+            set_result "failed"
+            exit 0
+          fi
+
+          deploy_output="$("$VERCEL_BIN" deploy --prebuilt --token="$VERCEL_TOKEN")"
+          if ! deployment_url="$(parse_deploy_url "$deploy_output")"; then
+            echo "::error title=Unable to parse deployment URL::vercel deploy did not return an immutable deployment URL."
+            set_result "failed"
+            exit 0
+          fi
+
+          if ! verify_ready "$deployment_url"; then
+            set_result "failed"
+            exit 0
+          fi
+
+          IFS=',' read -r -a aliases_array <<< "$STAGING_ALIASES"
+          for alias in "${aliases_array[@]}"; do
+            if ! previous_target="$(current_alias_target "$alias")"; then
+              echo "::error title=Unable to capture rollback target::Could not capture the existing deployment target for $alias."
+              set_result "failed"
+              exit 0
+            fi
+            printf '%s\n' "$previous_target" > "$rollback_prefix-$alias.target"
+          done
+
+          if [ "$EXPECTED_SHA" != "$ORIGIN_DEV_SHA" ]; then
+            set_result "superseded"
+            exit 0
+          fi
+
+          for alias in "${aliases_array[@]}"; do
+            if ! "$VERCEL_BIN" alias set "$deployment_url" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+              echo "::error title=Staging alias promotion failed::Failed to point $alias at the candidate deployment; attempting rollback."
+              rollback_aliases || true
+              exit 0
+            fi
+            promoted_aliases+=("$alias")
+            if ! verify_alias_points_to_candidate "$alias"; then
+              echo "::error title=Staging alias verification failed::$alias did not resolve to the candidate; attempting rollback."
+              rollback_aliases || true
+              exit 0
+            fi
+          done
+
+          set_result "success"
+
+      - name: Smoke staging candidate and aliases
+        id: smoke
+        if: steps.control.outputs.result == 'success'
+        env:
+          CURL_BIN: ${{ steps.tools.outputs.curl }}
+          DEPLOYMENT_URL: ${{ steps.control.outputs.deployment_url }}
+          PROMOTED_ALIASES: ${{ steps.control.outputs.promoted_aliases }}
+        run: |
+          set -euo pipefail
+
+          smoke_failed=false
+          "$CURL_BIN" --fail --silent --show-error --location --max-time 20 "$DEPLOYMENT_URL" >/dev/null || smoke_failed=true
+          IFS=',' read -r -a aliases_array <<< "$PROMOTED_ALIASES"
+          for alias in "${aliases_array[@]}"; do
+            "$CURL_BIN" --fail --silent --show-error --location --max-time 20 "https://${alias}" >/dev/null || smoke_failed=true
+          done
+
+          if [ "$smoke_failed" = "true" ]; then
+            echo "::error title=Staging smoke failed::Post-promotion unauthenticated smoke failed; this is a manual-recovery incident and no token-bearing rollback is attempted by design."
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "result=success" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize staging result
+        id: finalize
+        if: always()
+        env:
+          CONTROL_RESULT: ${{ steps.control.outputs.result }}
+          SMOKE_RESULT: ${{ steps.smoke.outputs.result }}
+          DEPLOYMENT_URL: ${{ steps.control.outputs.deployment_url }}
+          PROMOTED_ALIASES: ${{ steps.control.outputs.promoted_aliases }}
+        run: |
+          set -euo pipefail
+
+          RESULT="${SMOKE_RESULT:-$CONTROL_RESULT}"
+          if [ -z "$RESULT" ]; then
+            RESULT="failed"
+          fi
+
+          {
+            echo "deployment_url=${DEPLOYMENT_URL:-}"
+            echo "promoted_aliases=${PROMOTED_ALIASES:-}"
+            echo "result=$RESULT"
+          } >> "$GITHUB_OUTPUT"
+
+          case "$RESULT" in
+            success|superseded)
+              ;;
+            failed|rolled_back|rollback_failed)
+              echo "::error title=Staging deploy did not complete successfully::result=$RESULT"
+              exit 1
+              ;;
+            *)
+              echo "::error title=Unknown staging result::result=$RESULT"
+              exit 1
+              ;;
+          esac
