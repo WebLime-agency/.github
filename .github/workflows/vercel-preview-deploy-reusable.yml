@@ -175,6 +175,8 @@ jobs:
 
               if version != CONTRACT_VERSION:
                   raise TerminalNotifyError("Malformed broker ack", "Broker ACK version did not match contract version 1.")
+              if not isinstance(status, str):
+                  raise TerminalNotifyError("Malformed broker ack", "Broker ACK status must be a string.")
               if status not in SUCCESS_STATUSES and status != "rejected":
                   raise TerminalNotifyError("Malformed broker ack", "Broker ACK status was not accepted, duplicate, or rejected.")
               if not isinstance(request_id, str) or not request_id:
@@ -187,6 +189,8 @@ jobs:
                       raise TerminalNotifyError("Malformed broker ack", "Accepted or duplicate ACK must carry reason null and retryable false.")
                   return status, None
 
+              if not isinstance(reason, str):
+                  raise TerminalNotifyError("Malformed broker ack", "Rejected ACK reason must be a string.")
               if reason not in TERMINAL_REASONS | RETRYABLE_REASONS:
                   raise TerminalNotifyError("Malformed broker ack", "Rejected ACK reason was not recognized.")
               expected_retryable = reason in RETRYABLE_REASONS

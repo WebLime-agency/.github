@@ -477,6 +477,14 @@ test_tagged_union_violations_fail_closed() {
   run_server_case "missing-field" "$(ack_actions "$ack")" failure
   assert_file_contains "$CASE_OUT_FILE" "::error title=Malformed broker ack::"
 
+  ack=$'{"status":[],"version":"1","request_id":"WebLime-agency/example:12345","reason":null,"retryable":false}\n'
+  run_server_case "non-string-status" "$(ack_actions "$ack")" failure
+  assert_file_contains "$CASE_OUT_FILE" "::error title=Malformed broker ack::"
+
+  ack=$'{"status":"rejected","version":"1","request_id":"WebLime-agency/example:12345","reason":{},"retryable":false}\n'
+  run_server_case "non-string-reason" "$(ack_actions "$ack")" failure
+  assert_file_contains "$CASE_OUT_FILE" "::error title=Malformed broker ack::"
+
   pass "tagged-union ack violations fail closed"
 }
 
