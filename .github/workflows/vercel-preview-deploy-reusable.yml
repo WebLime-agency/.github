@@ -118,13 +118,18 @@ jobs:
 
           def read_ack_frame(sock):
               buffer = b""
+              read_deadline = time.monotonic() + DEADLINE_SECONDS
               while True:
                   if len(buffer) > ACK_MAX_BYTES:
                       raise TerminalNotifyError("Broker ack frame too large", "Broker ACK exceeded the 1 KiB frame limit before a newline.")
+                  remaining = read_deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TransientNotifyError("ACK read deadline expired before newline.")
+                  sock.settimeout(remaining)
                   try:
                       chunk = sock.recv(min(256, ACK_MAX_BYTES + 1 - len(buffer)))
                   except socket.timeout as exc:
-                      raise TransientNotifyError("ACK read timed out before newline.") from exc
+                      raise TransientNotifyError("ACK read deadline expired before newline.") from exc
                   except (ConnectionResetError, BrokenPipeError, OSError) as exc:
                       raise TransientNotifyError(f"Connection lost while reading ACK: {exc.__class__.__name__}.") from exc
 
@@ -196,6 +201,7 @@ jobs:
                   sock.settimeout(DEADLINE_SECONDS)
                   try:
                       sock.connect(socket_path)
+                      sock.settimeout(DEADLINE_SECONDS)
                       sock.sendall(frame)
                   except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError, socket.timeout) as exc:
                       raise TransientNotifyError(f"Broker channel was unavailable during connect/write: {exc.__class__.__name__}.") from exc

@@ -189,6 +189,17 @@ try:
         if kind == "ack":
             conn.sendall(action["payload"].encode("utf-8"))
             conn.close()
+        elif kind == "slow_ack":
+            payload = action["payload"].encode("utf-8")
+            chunk_size = max(1, (len(payload) + 2) // 3)
+            for offset in range(0, len(payload), chunk_size):
+                try:
+                    conn.sendall(payload[offset:offset + chunk_size])
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                if offset + chunk_size < len(payload):
+                    time.sleep(1.1)
+            conn.close()
         elif kind == "close":
             conn.close()
         elif kind == "partial":
@@ -268,7 +279,7 @@ import sys
 actions = []
 for raw in sys.argv[1:]:
     kind, _, payload = raw.partition(":")
-    if kind in {"ack", "partial"}:
+    if kind in {"ack", "partial", "slow_ack"}:
         actions.append({"kind": kind, "payload": payload})
     elif kind == "close":
         actions.append({"kind": "close"})
@@ -531,6 +542,19 @@ test_incomplete_read_transient_then_success() {
   pass "incomplete ack reads are transient acceptance-unknown"
 }
 
+test_read_deadline_is_total_not_per_chunk() {
+  local accepted actions
+  accepted="$(accepted_ack)"$'\n'
+  actions=$(mixed_actions "slow_ack:$accepted" "ack:$accepted")
+  run_server_case "slow-ack-deadline" "$actions" success
+  if [ "$(request_count "$CASE_COUNT_FILE")" != "2" ]; then
+    fail "slow-drip ack should exceed the total read deadline and retry"
+  fi
+  assert_request_frames_identical "$CASE_RECEIVED_FILE"
+  assert_file_contains "$CASE_OUT_FILE" "Transient broker notify error on attempt 1"
+  pass "two-second ack read deadline applies to the complete frame"
+}
+
 test_complete_malformed_duplicate_key_and_overcap_fail_terminal() {
   local ack actions
 
@@ -710,6 +734,7 @@ main() {
   test_terminal_rejected_reasons_fail_without_retry
   test_transient_channel_errors_retry_and_exhaust
   test_incomplete_read_transient_then_success
+  test_read_deadline_is_total_not_per_chunk
   test_complete_malformed_duplicate_key_and_overcap_fail_terminal
   test_timeout_after_commit_duplicate_success
   test_version_mismatch_ack_fail_closed
