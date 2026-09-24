@@ -3,14 +3,19 @@
 # Tests for .github/workflows/release-anchored-reusable.yml.
 #
 # Follows the pattern in tests/codex-review-workflow.sh: extract each named
-# `run:` block out of the workflow YAML, execute it against stubbed `gh` and a
-# real throwaway git repository, and assert on the behaviour.
+# `run:` block out of the workflow YAML, execute it against stubbed tooling and
+# a real throwaway git repository, and assert on the behaviour.
 #
-# What this covers: the branching logic — the gate's verdicts, the empty-range
-# guard, the tag guard, the verify comparison, and dry-run write suppression.
+# Covers the branching logic — the gate's verdicts, the empty-range guard, the
+# tag guard, the verify comparison, dry-run write suppression — and the
+# shared-runner hardening: a planted fsmonitor command, a planted hook and a
+# fake binary earlier on PATH must none of them run.
+#
 # What it cannot cover: a real workflow_run payload, a real deployed SHA, and
 # release-drafter's actual output. That is proven by a dry run from a caller
-# repository pinned at this branch.
+# repository pinned at this branch's head SHA.
+#
+# Requires: jq (as tests/codex-review-workflow.sh already does).
 #
 set -euo pipefail
 
@@ -20,6 +25,7 @@ TMP_ROOT=${TMPDIR:-/tmp}/release-anchored-workflow-test.$$
 STEPS_DIR="$TMP_ROOT/steps"
 STUB_DIR="$TMP_ROOT/bin"
 WORK_DIR="$TMP_ROOT/work"
+MARKER_DIR="$TMP_ROOT/markers"
 
 pass_count=0
 
@@ -58,6 +64,16 @@ assert_file_not_contains() {
   fi
 }
 
+assert_no_marker() {
+  local marker=$1
+  local what=$2
+  if [ -e "$MARKER_DIR/$marker" ]; then
+    echo "Marker $marker exists: $what executed" >&2
+    cat "$MARKER_DIR/$marker" >&2 || true
+    fail "$what ran"
+  fi
+}
+
 extract_step() {
   local step_name=$1
   local output_file=$2
@@ -84,88 +100,98 @@ extract_step() {
   fi
 }
 
-install_stubs() {
-  mkdir -p "$STUB_DIR"
+REAL_GIT=$(command -v git)
+REAL_JQ=$(command -v jq)
+REAL_DATE=$(command -v date)
+GIT_SAFE_VALUE="$REAL_GIT -c core.hooksPath=/dev/null -c core.fsmonitor=false"
 
-  # Emulates `gh api [--jq EXPR]` by serving a canned body and, when --jq is
-  # given, piping it through the real jq exactly as gh would.
-  cat > "$STUB_DIR/gh" <<'STUB'
+install_stubs() {
+  mkdir -p "$STUB_DIR" "$MARKER_DIR"
+
+  # Emulates `gh api [-f k=v] [--jq EXPR]` by serving a canned body and, when
+  # --jq is given, piping it through the real jq exactly as gh would. Every
+  # invocation is logged so tests can assert on what was called.
+  cat > "$STUB_DIR/gh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$1" = "api" ]; then
-  target=$2
+echo "\$*" >> "\${GH_CALL_LOG:-/dev/null}"
+
+if [ "\$1" = "api" ]; then
+  target=\$2
   shift 2
 
   jq_expr=
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --jq)
-        jq_expr=$2
-        shift 2
-        ;;
-      *)
-        shift
-        ;;
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --jq) jq_expr=\$2; shift 2 ;;
+      *) shift ;;
     esac
   done
 
   body=
-  case "$target" in
+  case "\$target" in
     *git/ref/heads/*)
-      body=$(jq -n --arg sha "${STUB_TIP_SHA:?STUB_TIP_SHA is required}" '{object: {sha: $sha}}')
+      body=\$($REAL_JQ -n --arg sha "\${STUB_TIP_SHA:?STUB_TIP_SHA is required}" '{object: {sha: \$sha}}')
       ;;
     *actions/workflows/*/runs*)
-      workflow=${target#*actions/workflows/}
-      workflow=${workflow%%/runs*}
-      var="STUB_CONCLUSION_$(printf %s "$workflow" | tr '.-' '__')"
-      conclusion=${!var:-success}
-      if [ "$conclusion" = "missing" ]; then
-        body=$(jq -n '{workflow_runs: []}')
+      workflow=\${target#*actions/workflows/}
+      workflow=\${workflow%%/runs*}
+      var="STUB_CONCLUSION_\$(printf %s "\$workflow" | tr '.-' '__')"
+      conclusion=\${!var:-success}
+      event=\${STUB_RUN_EVENT:-push}
+      head_repo=\${STUB_RUN_HEAD_REPO:-acme/app}
+      if [ "\$conclusion" = "missing" ]; then
+        body=\$($REAL_JQ -n '{workflow_runs: []}')
       else
-        body=$(jq -n --arg c "$conclusion" \
-          '{workflow_runs: [{conclusion: $c, html_url: "https://github.invalid/run/1"}]}')
+        body=\$($REAL_JQ -n --arg c "\$conclusion" --arg e "\$event" --arg r "\$head_repo" \\
+          '{workflow_runs: [{conclusion: \$c, event: \$e, head_repository: {full_name: \$r}, html_url: "https://github.invalid/run/1"}]}')
       fi
       ;;
     *commits/*/pulls)
-      body=${STUB_COMMIT_PULLS:-'[]'}
+      body=\${STUB_COMMIT_PULLS:-'[]'}
+      ;;
+    *git/tags)
+      body=\$($REAL_JQ -n '{sha: "aaaabbbbccccddddeeeeffff0000111122223333"}')
+      ;;
+    *git/refs)
+      body=\$($REAL_JQ -n '{ref: "refs/tags/created"}')
       ;;
     *)
-      echo "unexpected gh api target: $target" >&2
+      echo "unexpected gh api target: \$target" >&2
       exit 2
       ;;
   esac
 
-  if [ -n "$jq_expr" ]; then
-    printf '%s' "$body" | jq -r "$jq_expr"
+  if [ -n "\$jq_expr" ]; then
+    printf '%s' "\$body" | $REAL_JQ -r "\$jq_expr"
   else
-    printf '%s' "$body"
+    printf '%s' "\$body"
   fi
   exit 0
 fi
 
-if [ "$1" = "release" ]; then
-  echo "$*" >> "${GH_RELEASE_LOG:?GH_RELEASE_LOG is required}"
-  # `release view` decides create-vs-edit; default to "not found".
-  if [ "$2" = "view" ]; then
-    exit "${GH_RELEASE_VIEW_EXIT:-1}"
+if [ "\$1" = "release" ]; then
+  echo "\$*" >> "\${GH_RELEASE_LOG:-/dev/null}"
+  if [ "\$2" = "view" ]; then
+    exit "\${GH_RELEASE_VIEW_EXIT:-1}"
   fi
   exit 0
 fi
 
-if [ "$1" = "label" ]; then
-  if [ "${STUB_LABEL_EXISTS:-true}" = "true" ]; then
+if [ "\$1" = "label" ]; then
+  if [ "\${STUB_LABEL_EXISTS:-true}" = "true" ]; then
     echo "release-automation"
   fi
   exit 0
 fi
 
-if [ "$1" = "issue" ]; then
-  echo "$*" >> "${GH_ISSUE_LOG:-/dev/null}"
+if [ "\$1" = "issue" ]; then
+  echo "\$*" >> "\${GH_ISSUE_LOG:-/dev/null}"
   exit 0
 fi
 
-echo "unexpected gh invocation: $*" >&2
+echo "unexpected gh invocation: \$*" >&2
 exit 2
 STUB
   chmod +x "$STUB_DIR/gh"
@@ -177,7 +203,8 @@ new_github_output() {
   echo "$file"
 }
 
-# Runs an extracted step. Prints nothing on success; captures stdout+stderr.
+# Runs an extracted step with the tool paths the workflow's preflight would
+# have set. Defaults come first so a test can override any of them.
 run_step() {
   local script=$1
   local log=$2
@@ -187,12 +214,16 @@ run_step() {
     cd "$WORK_DIR"
     PATH="$STUB_DIR:$PATH"
     export PATH
-    env "$@" bash "$script"
+    env \
+      "GIT_SAFE=$GIT_SAFE_VALUE" \
+      "GH_BIN=$STUB_DIR/gh" \
+      "JQ_BIN=$REAL_JQ" \
+      "DATE_BIN=$REAL_DATE" \
+      "GIT_CONFIG_NOSYSTEM=1" \
+      "$@" bash "$script"
   ) > "$log" 2>&1
 }
 
-# Same as run_step, but a non-zero exit is reported with its log rather than
-# aborting the suite silently under `set -e`.
 run_step_ok() {
   local script=$1
   local log=$2
@@ -208,21 +239,19 @@ run_step_ok() {
 setup_repo() {
   rm -rf "$WORK_DIR"
   mkdir -p "$WORK_DIR"
-  git -C "$WORK_DIR" init -q -b main
-  git -C "$WORK_DIR" config user.email "test@example.invalid"
-  git -C "$WORK_DIR" config user.name "Test"
-  git -C "$WORK_DIR" commit -q --allow-empty -m "first"
-  git -C "$WORK_DIR" tag -a "v2020.1.1" -m "baseline"
-  git -C "$WORK_DIR" commit -q --allow-empty -m "second"
-
-  git init -q --bare "$TMP_ROOT/remote.git"
-  git -C "$WORK_DIR" remote add origin "$TMP_ROOT/remote.git"
+  "$REAL_GIT" -C "$WORK_DIR" init -q -b main
+  "$REAL_GIT" -C "$WORK_DIR" config user.email "test@example.invalid"
+  "$REAL_GIT" -C "$WORK_DIR" config user.name "Test"
+  "$REAL_GIT" -C "$WORK_DIR" commit -q --allow-empty -m "first"
+  "$REAL_GIT" -C "$WORK_DIR" tag -a "v2020.1.1" -m "baseline"
+  "$REAL_GIT" -C "$WORK_DIR" commit -q --allow-empty -m "second"
 }
 
 mkdir -p "$STEPS_DIR"
 install_stubs
 
 extract_step "Gate on a proven production deploy" "$STEPS_DIR/gate.sh"
+extract_step "Verify the checkout" "$STEPS_DIR/verify-checkout.sh"
 extract_step "Compute release range" "$STEPS_DIR/range.sh"
 extract_step "Resolve and create the release tag" "$STEPS_DIR/tag.sh"
 extract_step "Verify the notes cover the whole range" "$STEPS_DIR/verify.sh"
@@ -240,8 +269,7 @@ out=$(new_github_output)
 run_step_ok "$STEPS_DIR/gate.sh" "$TMP_ROOT/gate-ok.log" \
   "GITHUB_OUTPUT=$out" "STUB_TIP_SHA=$TIP" \
   "REPO=acme/app" "EVENT_NAME=workflow_run" "TRIGGER_SHA=$TIP" "INPUT_SHA=" \
-  "PRODUCTION_BRANCH=main" "REQUIRED_DEPLOY=" \
-  "REQUIRED_WORKFLOWS=deploy.yml,vercel-production.yml"
+  "PRODUCTION_BRANCH=main" "REQUIRED_WORKFLOWS=deploy.yml,vercel-production.yml"
 assert_file_contains "$out" "skip=false"
 assert_file_contains "$out" "sha=$TIP"
 pass "gate passes when every required deploy workflow succeeded for the tip"
@@ -284,13 +312,131 @@ run_step_ok "$STEPS_DIR/gate.sh" "$TMP_ROOT/gate-failed.log" \
 assert_file_contains "$out" "skip=true"
 pass "a failed deploy run is a no-op, not a release"
 
-# --------------------------------------------------------------- range ------
+# A pull_request run of the same workflow file, from a fork whose head branch
+# happens to be named `main`, must not satisfy the gate.
+out=$(new_github_output)
+run_step_ok "$STEPS_DIR/gate.sh" "$TMP_ROOT/gate-pr-event.log" \
+  "GITHUB_OUTPUT=$out" "STUB_TIP_SHA=$TIP" \
+  "REPO=acme/app" "EVENT_NAME=workflow_run" "TRIGGER_SHA=$TIP" "INPUT_SHA=" \
+  "PRODUCTION_BRANCH=main" "REQUIRED_WORKFLOWS=deploy.yml" \
+  "STUB_RUN_EVENT=pull_request"
+assert_file_contains "$out" "skip=true"
+pass "a pull_request run of the deploy workflow cannot satisfy the gate"
 
+out=$(new_github_output)
+run_step_ok "$STEPS_DIR/gate.sh" "$TMP_ROOT/gate-fork.log" \
+  "GITHUB_OUTPUT=$out" "STUB_TIP_SHA=$TIP" \
+  "REPO=acme/app" "EVENT_NAME=workflow_run" "TRIGGER_SHA=$TIP" "INPUT_SHA=" \
+  "PRODUCTION_BRANCH=main" "REQUIRED_WORKFLOWS=deploy.yml" \
+  "STUB_RUN_HEAD_REPO=attacker/app"
+assert_file_contains "$out" "skip=true"
+pass "a deploy run from another repository cannot satisfy the gate"
+
+# ------------------------------------------------------------ hardening -----
+
+# core.fsmonitor makes git execute an arbitrary command on `git status`. A
+# previous job on a shared runner can plant one in .git/config. Every git call
+# passes -c core.fsmonitor=false, so it must never run.
 setup_repo
-HEAD_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+cat > "$TMP_ROOT/evil-fsmonitor" <<EVIL
+#!/usr/bin/env bash
+echo "fsmonitor executed" > "$MARKER_DIR/fsmonitor"
+EVIL
+chmod +x "$TMP_ROOT/evil-fsmonitor"
+"$REAL_GIT" -C "$WORK_DIR" config core.fsmonitor "$TMP_ROOT/evil-fsmonitor"
+
+run_step_ok "$STEPS_DIR/verify-checkout.sh" "$TMP_ROOT/harden-fsmonitor.log" \
+  "SHA=$HEAD_SHA"
+assert_no_marker fsmonitor "a planted core.fsmonitor command"
+pass "a planted core.fsmonitor command never executes"
+
+# A planted hook must not run either. The tag step creates tags through the
+# API rather than `git push`, so no push hook is reachable, and every git call
+# disables hooksPath regardless.
+setup_repo
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+mkdir -p "$WORK_DIR/.git/hooks"
+cat > "$WORK_DIR/.git/hooks/pre-push" <<EVIL
+#!/usr/bin/env bash
+echo "pre-push executed" > "$MARKER_DIR/pre-push"
+EVIL
+chmod +x "$WORK_DIR/.git/hooks/pre-push"
+cat > "$WORK_DIR/.git/hooks/post-checkout" <<EVIL
+#!/usr/bin/env bash
+echo "post-checkout executed" > "$MARKER_DIR/post-checkout"
+EVIL
+chmod +x "$WORK_DIR/.git/hooks/post-checkout"
+
+out=$(new_github_output)
+GH_CALL_LOG="$TMP_ROOT/gh-calls.log"
+: > "$GH_CALL_LOG"
+run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/harden-hooks.log" \
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+assert_no_marker pre-push "a planted pre-push hook"
+assert_no_marker post-checkout "a planted post-checkout hook"
+assert_file_not_contains "$TMP_ROOT/harden-hooks.log" "git push"
+pass "planted git hooks never execute; the tag is created without a push"
+
+# The tag is created through the API, so no credential is written into any git
+# config where a hook could read it.
+assert_file_contains "$GH_CALL_LOG" "api repos/acme/app/git/tags"
+assert_file_contains "$GH_CALL_LOG" "api repos/acme/app/git/refs"
+pass "the tag is created via the API, not via an authenticated git push"
+
+# A fake binary earlier on PATH must be ignored: the workflow uses the
+# absolute paths its preflight resolved.
+setup_repo
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+cat > "$STUB_DIR/git" <<EVIL
+#!/usr/bin/env bash
+echo "fake git executed" > "$MARKER_DIR/fake-git"
+exit 0
+EVIL
+chmod +x "$STUB_DIR/git"
+cat > "$STUB_DIR/jq" <<EVIL
+#!/usr/bin/env bash
+echo "fake jq executed" > "$MARKER_DIR/fake-jq"
+exit 0
+EVIL
+chmod +x "$STUB_DIR/jq"
 
 out=$(new_github_output)
 summary="$TMP_ROOT/summary.md"
+: > "$summary"
+run_step_ok "$STEPS_DIR/range.sh" "$TMP_ROOT/harden-path.log" \
+  "GITHUB_OUTPUT=$out" "GITHUB_STEP_SUMMARY=$summary" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MAX_COMMITS=300" \
+  "STUB_COMMIT_PULLS=[{\"number\":7,\"title\":\"Add a thing\",\"labels\":[{\"name\":\"release/new\"}]}]"
+assert_no_marker fake-git "a fake git earlier on PATH"
+assert_no_marker fake-jq "a fake jq earlier on PATH"
+assert_file_contains "$out" "skip=false"
+pass "fake git and jq earlier on PATH are never used"
+rm -f "$STUB_DIR/git" "$STUB_DIR/jq"
+
+# The preflight itself is fail-closed by construction.
+PREFLIGHT=$(awk '/^      - name: Verify the toolchain/,/^      - name: Gate/' "$WORKFLOW_FILE")
+printf '%s' "$PREFLIGHT" | grep -q "stat -c '%U'" || fail "preflight must check tool ownership"
+printf '%s' "$PREFLIGHT" | grep -q '& 022' || fail "preflight must reject group/world-writable tools"
+printf '%s' "$PREFLIGHT" | grep -q 'Tool not found' || fail "preflight must fail closed when a tool is missing"
+printf '%s' "$PREFLIGHT" | grep -q 'GIT_CONFIG_NOSYSTEM=1' || fail "preflight must neutralise system git config"
+pass "the toolchain preflight checks ownership, writability and fails closed"
+
+grep -q 'persist-credentials: false' "$WORKFLOW_FILE" \
+  || fail "checkout must not persist credentials into .git/config"
+grep -qE 'uses: actions/checkout@[0-9a-f]{40}' "$WORKFLOW_FILE" \
+  || fail "actions/checkout must be pinned to a full commit SHA"
+grep -q 'CHECKOUT_DIR: .release-anchored/' "$WORKFLOW_FILE" \
+  || fail "checkout must use a per-run directory, not the reused workspace"
+pass "checkout is SHA-pinned, credential-free and lands in a per-run directory"
+
+# --------------------------------------------------------------- range ------
+
+setup_repo
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+
+out=$(new_github_output)
 : > "$summary"
 run_step_ok "$STEPS_DIR/range.sh" "$TMP_ROOT/range-internal.log" \
   "GITHUB_OUTPUT=$out" "GITHUB_STEP_SUMMARY=$summary" \
@@ -314,12 +460,11 @@ pass "skipped PRs are excluded from the expected set, releasable work is kept"
 
 # The baseline case: the only release tag in the repository sits on the commit
 # being released. Production has not moved, so this is a no-op — not a walk of
-# the entire history, which is what the `^` in the previous-tag lookup would
-# otherwise cause.
+# the entire history.
 setup_repo
-BASELINE_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
-git -C "$WORK_DIR" tag -d v2020.1.1 >/dev/null
-git -C "$WORK_DIR" tag -a v0.0.0 -m "baseline" "$BASELINE_SHA"
+BASELINE_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+"$REAL_GIT" -C "$WORK_DIR" tag -d v2020.1.1 >/dev/null
+"$REAL_GIT" -C "$WORK_DIR" tag -a v0.0.0 -m "baseline" "$BASELINE_SHA"
 
 out=$(new_github_output)
 : > "$summary"
@@ -333,7 +478,7 @@ assert_file_not_contains "$TMP_ROOT/range-baseline.log" "Walking the full histor
 pass "a commit carrying the only release tag is a no-op, not a full-history walk"
 
 setup_repo
-HEAD_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
 
 out=$(new_github_output)
 : > "$summary"
@@ -349,49 +494,54 @@ pass "an oversized range fails rather than risking truncated notes"
 # ----------------------------------------------------------------- tag ------
 
 setup_repo
-HEAD_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
-PARENT_SHA=$(git -C "$WORK_DIR" rev-parse HEAD^)
+HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
+PARENT_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD^)
 
 out=$(new_github_output)
+: > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-dryrun.log" \
-  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=dry-run"
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=dry-run"
 assert_file_contains "$TMP_ROOT/tag-dryrun.log" "[dry-run] would create annotated tag"
-if [ -n "$(git -C "$WORK_DIR" tag --points-at "$HEAD_SHA")" ]; then
-  fail "dry-run must not create a tag"
-fi
-pass "dry-run resolves a tag name without creating or pushing it"
+assert_file_not_contains "$GH_CALL_LOG" "git/tags"
+pass "dry-run resolves a tag name without creating it"
 
 out=$(new_github_output)
+: > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-create.log" \
-  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
-TAG_CREATED=$(git -C "$WORK_DIR" tag --points-at "$HEAD_SHA" --list 'v[0-9]*' | head -n 1)
-[ -n "$TAG_CREATED" ] || fail "publish mode should create an annotated tag"
-[ "$(git -C "$WORK_DIR" cat-file -t "$TAG_CREATED")" = "tag" ] || fail "tag must be annotated"
-assert_file_contains "$out" "tag=$TAG_CREATED"
-pass "publish mode creates an annotated tag and pushes it"
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+assert_file_contains "$GH_CALL_LOG" "-f type=commit"
+assert_file_contains "$GH_CALL_LOG" "api repos/acme/app/git/refs"
+TAG_NAME=$(grep '^tag=' "$out" | cut -d= -f2)
+[ -n "$TAG_NAME" ] || fail "tag step must output a tag name"
+pass "publish mode creates an annotated tag object and its ref via the API"
 
+# The tag now exists remotely but not locally, which is what a re-run sees
+# after checkout fetches it.
+"$REAL_GIT" -C "$WORK_DIR" tag -a "$TAG_NAME" -m "Release $TAG_NAME" "$HEAD_SHA"
 out=$(new_github_output)
+: > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-rerun.log" \
-  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
 assert_file_contains "$TMP_ROOT/tag-rerun.log" "Reusing existing tag"
-assert_file_contains "$out" "tag=$TAG_CREATED"
-COUNT=$(git -C "$WORK_DIR" tag --list 'v[0-9]*' | wc -l)
-[ "$COUNT" -eq 2 ] || fail "a re-run must not create a second tag (found $COUNT)"
-pass "re-running against an already-tagged SHA reuses the tag"
+assert_file_contains "$out" "tag=$TAG_NAME"
+assert_file_not_contains "$GH_CALL_LOG" "git/tags"
+pass "re-running against an already-tagged SHA reuses it and creates nothing"
 
-# Point today's computed tag at a different commit, then demand our SHA.
-BASE_TAG="v$(date -u +%Y.%-m.%-d)"
-git -C "$WORK_DIR" tag -d "$TAG_CREATED" >/dev/null
-git -C "$WORK_DIR" tag -a "$BASE_TAG" -m "wrong place" "$PARENT_SHA"
+"$REAL_GIT" -C "$WORK_DIR" tag -d "$TAG_NAME" >/dev/null
+BASE_TAG="v$("$REAL_DATE" -u +%Y.%-m.%-d)"
+"$REAL_GIT" -C "$WORK_DIR" tag -a "$BASE_TAG" -m "wrong place" "$PARENT_SHA"
 out=$(new_github_output)
-if run_step "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-conflict.log" \
-  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"; then
-  : # a free suffix is fine; the conflict case is asserted below
-fi
-assert_file_not_contains "$TMP_ROOT/tag-conflict.log" "error"
-if [ "$(git -C "$WORK_DIR" rev-list -n 1 "$BASE_TAG")" != "$PARENT_SHA" ]; then
+: > "$GH_CALL_LOG"
+run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-conflict.log" \
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+if [ "$("$REAL_GIT" -C "$WORK_DIR" rev-list -n 1 "$BASE_TAG")" != "$PARENT_SHA" ]; then
   fail "an existing tag must never be moved"
 fi
+assert_file_contains "$out" "tag=${BASE_TAG}.2"
 pass "an occupied tag name is never moved; a free suffix is taken instead"
 
 # -------------------------------------------------------------- verify ------
@@ -405,6 +555,14 @@ run_step_ok "$STEPS_DIR/verify.sh" "$TMP_ROOT/verify-ok.log" \
 assert_file_contains "$TMP_ROOT/verify-ok.log" "Verified"
 pass "verify passes when the notes cover every PR in the range"
 
+# An issue reference inside a PR title must not be counted as a PR number.
+printf '7\n' > "$WORK_DIR/expected_prs.txt"
+run_step_ok "$STEPS_DIR/verify.sh" "$TMP_ROOT/verify-issue-ref.log" \
+  "BODY=- Fix the thing reported in #4321 (#7)"
+assert_file_contains "$TMP_ROOT/verify-issue-ref.log" "Verified"
+pass "an issue reference in a title is not mistaken for a pull request"
+
+printf '7\n8\n' > "$WORK_DIR/expected_prs.txt"
 if run_step "$STEPS_DIR/verify.sh" "$TMP_ROOT/verify-short.log" \
   "GITHUB_STEP_SUMMARY=$TMP_ROOT/summary2.md" \
   "BODY=- Add a thing (#7)"; then
@@ -427,9 +585,6 @@ JSON
 RELEASE_LOG="$TMP_ROOT/gh-release.log"
 : > "$RELEASE_LOG"
 
-# The prose body and release.json are built from the SAME two sources — the
-# notes release-drafter rendered, and prs.json — so asserting on both proves
-# the split is real rather than an artefact of the fixture.
 DRAFTED_BODY="## New
 
 - Add a thing (#7)
@@ -443,7 +598,6 @@ run_step_ok "$STEPS_DIR/release.sh" "$TMP_ROOT/release-dryrun.log" \
   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "PREV_TAG=v2026.9.23" \
   "MODE=dry-run" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=$DRAFTED_BODY"
 if [ -s "$RELEASE_LOG" ]; then
-  echo "gh was called:" >&2
   cat "$RELEASE_LOG" >&2
   fail "dry-run must not issue any gh release write"
 fi
@@ -462,7 +616,7 @@ pass "the prose body keeps security lines and links the full changelog"
 run_step_ok "$STEPS_DIR/release.sh" "$TMP_ROOT/release-publish.log" \
   "GITHUB_STEP_SUMMARY=$TMP_ROOT/summary4.md" "GH_RELEASE_LOG=$RELEASE_LOG" \
   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "PREV_TAG=v2026.9.23" \
-  "MODE=publish" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=- Add a thing (#7)"
+  "MODE=publish" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=$DRAFTED_BODY"
 assert_file_contains "$RELEASE_LOG" "release create v2026.9.24"
 assert_file_contains "$RELEASE_LOG" "release upload v2026.9.24 release.json --clobber"
 assert_file_not_contains "$RELEASE_LOG" "--draft"
@@ -473,7 +627,7 @@ run_step_ok "$STEPS_DIR/release.sh" "$TMP_ROOT/release-existing.log" \
   "GITHUB_STEP_SUMMARY=$TMP_ROOT/summary5.md" "GH_RELEASE_LOG=$RELEASE_LOG" \
   "GH_RELEASE_VIEW_EXIT=0" \
   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "PREV_TAG=v2026.9.23" \
-  "MODE=publish" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=- Add a thing (#7)"
+  "MODE=publish" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=$DRAFTED_BODY"
 assert_file_contains "$RELEASE_LOG" "release edit v2026.9.24"
 assert_file_not_contains "$RELEASE_LOG" "release create"
 pass "an existing release is edited in place rather than duplicated"
@@ -482,15 +636,12 @@ pass "an existing release is edited in place rather than duplicated"
 run_step_ok "$STEPS_DIR/release.sh" "$TMP_ROOT/release-draft.log" \
   "GITHUB_STEP_SUMMARY=$TMP_ROOT/summary6.md" "GH_RELEASE_LOG=$RELEASE_LOG" \
   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "PREV_TAG=" \
-  "MODE=draft" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=- Add a thing (#7)"
+  "MODE=draft" "DEPLOY_SUMMARY=- deploy.yml: success" "BODY=$DRAFTED_BODY"
 assert_file_contains "$RELEASE_LOG" "--draft"
 pass "draft mode creates the release as a draft"
 
 # --------------------------------------------------------------- labels -----
 
-# GitHub rejects a label description over 100 characters with HTTP 422, part
-# way through the loop, leaving the repository with some labels created and
-# some missing. The script checks every entry before writing anything.
 LABEL_SCRIPT="$ROOT_DIR/scripts/sync-release-labels.sh"
 
 if ! bash "$LABEL_SCRIPT" --dry-run acme/app > "$TMP_ROOT/labels-dryrun.log" 2>&1; then
@@ -508,27 +659,30 @@ while IFS='|' read -r name _ description; do
   if [ "${#description}" -gt 100 ]; then
     fail "label description for $name is ${#description} characters; GitHub allows 100"
   fi
-done < <(sed -n "s/^  '\(release[/-][a-z-]*\)|\([0-9a-f]*\)|\(.*\)'$/||/p" "$LABEL_SCRIPT")
+done < <(sed -n "s/^  '\(release[/-][a-z-]*\)|\([0-9a-f]*\)|\(.*\)'$/\1|\2|\3/p" "$LABEL_SCRIPT")
 pass "every label description fits GitHub's 100 character limit"
 
 # -------------------------------------------------------------- notify -----
 
-# The gate reads deploy run conclusions, which needs `actions: read`. Without
-# it every run dies with HTTP 403 before it can tell pending from successful.
 PERMS=$(awk '/^permissions:/{f=1;next} /^[a-z]/{f=0} f' "$WORKFLOW_FILE")
-printf '%s' "$PERMS" | grep -q 'actions: read'   || fail "the workflow must declare actions: read, or the gate cannot list deploy runs"
+printf '%s' "$PERMS" | grep -q 'actions: read' \
+  || fail "the workflow must declare actions: read, or the gate cannot list deploy runs"
 pass "the workflow requests actions: read for the gate's run lookups"
 
 ISSUE_LOG="$TMP_ROOT/gh-issue.log"
 : > "$ISSUE_LOG"
-run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-labelled.log"   "GH_ISSUE_LOG=$ISSUE_LOG" "GH_RELEASE_LOG=$TMP_ROOT/unused.log"   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish"   "RUN_URL=https://github.invalid/run/1"
+run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-labelled.log" \
+  "GH_ISSUE_LOG=$ISSUE_LOG" \
+  "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish" \
+  "RUN_URL=https://github.invalid/run/1"
 assert_file_contains "$ISSUE_LOG" "--label release-automation"
 pass "a failure opens a labelled release-automation issue"
 
-# An absent label must not swallow the alert: gh validates labels before
-# creating anything, so this would otherwise mean no issue at all.
 : > "$ISSUE_LOG"
-run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-unlabelled.log"   "GH_ISSUE_LOG=$ISSUE_LOG" "GH_RELEASE_LOG=$TMP_ROOT/unused.log"   "STUB_LABEL_EXISTS=false"   "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish"   "RUN_URL=https://github.invalid/run/1"
+run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-unlabelled.log" \
+  "GH_ISSUE_LOG=$ISSUE_LOG" "STUB_LABEL_EXISTS=false" \
+  "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish" \
+  "RUN_URL=https://github.invalid/run/1"
 assert_file_contains "$ISSUE_LOG" "issue create"
 assert_file_not_contains "$ISSUE_LOG" "--label"
 assert_file_contains "$TMP_ROOT/notify-unlabelled.log" "Missing label"
