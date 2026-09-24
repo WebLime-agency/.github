@@ -312,6 +312,29 @@ assert_file_contains "$WORK_DIR/expected_prs.txt" "7"
 assert_file_not_contains "$WORK_DIR/expected_prs.txt" "8"
 pass "skipped PRs are excluded from the expected set, releasable work is kept"
 
+# The baseline case: the only release tag in the repository sits on the commit
+# being released. Production has not moved, so this is a no-op — not a walk of
+# the entire history, which is what the `^` in the previous-tag lookup would
+# otherwise cause.
+setup_repo
+BASELINE_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
+git -C "$WORK_DIR" tag -d v2020.1.1 >/dev/null
+git -C "$WORK_DIR" tag -a v0.0.0 -m "baseline" "$BASELINE_SHA"
+
+out=$(new_github_output)
+: > "$summary"
+run_step_ok "$STEPS_DIR/range.sh" "$TMP_ROOT/range-baseline.log" \
+  "GITHUB_OUTPUT=$out" "GITHUB_STEP_SUMMARY=$summary" \
+  "REPO=acme/app" "SHA=$BASELINE_SHA" "TAG_PREFIX=v" "MAX_COMMITS=300" \
+  "STUB_COMMIT_PULLS=[]"
+assert_file_contains "$out" "skip=true"
+assert_file_contains "$TMP_ROOT/range-baseline.log" "already marks"
+assert_file_not_contains "$TMP_ROOT/range-baseline.log" "Walking the full history"
+pass "a commit carrying the only release tag is a no-op, not a full-history walk"
+
+setup_repo
+HEAD_SHA=$(git -C "$WORK_DIR" rev-parse HEAD)
+
 out=$(new_github_output)
 : > "$summary"
 if run_step "$STEPS_DIR/range.sh" "$TMP_ROOT/range-toobig.log" \

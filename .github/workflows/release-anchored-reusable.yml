@@ -187,7 +187,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # `${SHA}^` excludes a tag on the SHA itself, so that re-running against
+          # an already-released commit still finds the release before it.
           PREV_TAG=$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}[0-9]*" "${SHA}^" 2>/dev/null || true)
+          TAG_AT_SHA=$(git tag --points-at "${SHA}" --list "${TAG_PREFIX}[0-9]*" | head -n 1)
+
+          # The consequence of that `^`: a commit carrying the only release tag
+          # in the repository — the baseline, right after it is created — looks
+          # identical to a repository with no releases at all, and we would walk
+          # the entire history instead of reporting that production has not
+          # moved.
+          if [ -z "${PREV_TAG}" ] && [ -n "${TAG_AT_SHA}" ]; then
+            echo "::notice title=Nothing to release::${TAG_AT_SHA} already marks ${SHA} and there is no earlier release tag. Production has not moved since. No tag and no release created."
+            echo "- **Result:** nothing to release; ${TAG_AT_SHA} already marks this commit." >> "${GITHUB_STEP_SUMMARY}"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
           if [ -n "${PREV_TAG}" ]; then
             RANGE="${PREV_TAG}..${SHA}"
           else
