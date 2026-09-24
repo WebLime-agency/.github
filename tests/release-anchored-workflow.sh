@@ -102,7 +102,6 @@ extract_step() {
 
 REAL_GIT=$(command -v git)
 REAL_JQ=$(command -v jq)
-REAL_DATE=$(command -v date)
 GIT_SAFE_VALUE="$REAL_GIT -c core.hooksPath=/dev/null -c core.fsmonitor=false"
 
 install_stubs() {
@@ -218,7 +217,6 @@ run_step() {
       "GIT_SAFE=$GIT_SAFE_VALUE" \
       "GH_BIN=$STUB_DIR/gh" \
       "JQ_BIN=$REAL_JQ" \
-      "DATE_BIN=$REAL_DATE" \
       "GIT_CONFIG_NOSYSTEM=1" \
       "$@" bash "$script"
   ) > "$log" 2>&1
@@ -477,6 +475,8 @@ printf '%s' "$RESULT" | grep -q 'no trusted binary'   || fail "a missing tool mu
 pass "a missing tool fails closed, naming the paths it looked in"
 
 grep -q 'GIT_CONFIG_NOSYSTEM=1' "$STEPS_DIR/tools.sh"   || fail "preflight must neutralise system git config"
+grep -q 'DATE_BIN' "$STEPS_DIR/tools.sh"   && fail "the workflow must not depend on /usr/bin/date; use bash strftime"
+grep -q "printf -v CAL_Y" "$STEPS_DIR/tag.sh"   || fail "the CalVer tag must come from bash strftime, not an external binary"
 grep -qE 'STAT_BIN=.*|/usr/bin/stat' "$STEPS_DIR/tools.sh"   || fail "stat itself must be resolved absolutely"
 pass "the preflight pins stat absolutely and neutralises system git config"
 
@@ -588,7 +588,8 @@ assert_file_not_contains "$GH_CALL_LOG" "git/tags"
 pass "re-running against an already-tagged SHA reuses it and creates nothing"
 
 "$REAL_GIT" -C "$WORK_DIR" tag -d "$TAG_NAME" >/dev/null
-BASE_TAG="v$("$REAL_DATE" -u +%Y.%-m.%-d)"
+TZ=UTC printf -v CAL_Y '%(%Y)T' -1; TZ=UTC printf -v CAL_M '%(%m)T' -1; TZ=UTC printf -v CAL_D '%(%d)T' -1
+BASE_TAG="v${CAL_Y}.$((10#${CAL_M})).$((10#${CAL_D}))"
 "$REAL_GIT" -C "$WORK_DIR" tag -a "$BASE_TAG" -m "wrong place" "$PARENT_SHA"
 out=$(new_github_output)
 : > "$GH_CALL_LOG"

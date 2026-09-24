@@ -124,7 +124,7 @@ jobs:
           set -euo pipefail
 
           # PATH is not trusted: a previous job on a shared runner can leave a
-          # fake `git`, `gh`, `jq` or `date` earlier on it. Resolve each tool to
+          # fake `git`, `gh` or `jq` earlier on it. Resolve each tool to
           # a fixed absolute path and fail closed unless it is owned by root and
           # not group- or world-writable.
           #
@@ -192,14 +192,10 @@ jobs:
           GH_BIN="${RESOLVED_TOOL}"
           require_tool jq /usr/bin/jq /usr/local/bin/jq
           JQ_BIN="${RESOLVED_TOOL}"
-          require_tool date /usr/bin/date /bin/date
-          DATE_BIN="${RESOLVED_TOOL}"
-
           {
             echo "GIT_BIN=${GIT_BIN}"
             echo "GH_BIN=${GH_BIN}"
             echo "JQ_BIN=${JQ_BIN}"
-            echo "DATE_BIN=${DATE_BIN}"
             # Neutralises /etc/gitconfig and ~/.gitconfig, either of which a
             # previous job could have written.
             echo "GIT_CONFIG_NOSYSTEM=1"
@@ -467,7 +463,14 @@ jobs:
             # Unpadded CalVer. Zero-padded months fail release-drafter's semver
             # coercion, which silently drops our own previous releases from the
             # candidate set and makes every run behave like the first.
-            BASE="${TAG_PREFIX}$("${DATE_BIN}" -u +%Y.%-m.%-d)"
+            # Dates come from bash's own strftime rather than /usr/bin/date:
+            # one fewer binary to trust on a shared runner. `%-m` is not
+            # supported here, so strip the padding with base-10 arithmetic —
+            # `10#` keeps `08` and `09` from being read as invalid octal.
+            TZ=UTC printf -v CAL_Y '%(%Y)T' -1
+            TZ=UTC printf -v CAL_M '%(%m)T' -1
+            TZ=UTC printf -v CAL_D '%(%d)T' -1
+            BASE="${TAG_PREFIX}${CAL_Y}.$((10#${CAL_M})).$((10#${CAL_D}))"
             TAG="${BASE}"
             SUFFIX=1
             while ${GIT_SAFE} rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; do
@@ -576,6 +579,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          TZ=UTC printf -v DEPLOYED_AT '%(%Y-%m-%dT%H:%M:%SZ)T' -1
+
           if [ -n "${PREV_TAG}" ]; then
             COMPARE="https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
           else
@@ -601,7 +606,7 @@ jobs:
           "${JQ_BIN}" \
             --arg tag "${TAG}" \
             --arg sha "${SHA}" \
-            --arg deployed_at "$("${DATE_BIN}" -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg deployed_at "${DEPLOYED_AT}" \
             --arg compare_url "${COMPARE}" \
             '{
               tag: $tag,
@@ -690,6 +695,8 @@ jobs:
             echo "Re-run with the explicit SHA once fixed. The workflow is idempotent: an existing tag is reused and an existing release is edited in place."
           } > issue_body.md
 
+          TZ=UTC printf -v TODAY '%(%Y-%m-%d)T' -1
+
           # The alert must not fail because its own label is missing. gh
           # validates labels before creating anything, so an absent label means
           # no issue at all — at exactly the moment one is most needed.
@@ -703,6 +710,6 @@ jobs:
 
           "${GH_BIN:-gh}" issue create \
             --repo "${REPO}" \
-            --title "Production release failed ($("${DATE_BIN:-date}" -u +%Y-%m-%d))" \
+            --title "Production release failed (${TODAY})" \
             --body-file issue_body.md \
             "${LABEL_ARGS[@]}"
