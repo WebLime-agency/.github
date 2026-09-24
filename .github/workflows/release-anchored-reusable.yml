@@ -127,40 +127,73 @@ jobs:
           # fake `git`, `gh`, `jq` or `date` earlier on it. Resolve each tool to
           # a fixed absolute path and fail closed unless it is owned by root and
           # not group- or world-writable.
+          #
+          # `stat` is what does the verifying, so it is resolved absolutely too,
+          # before anything else. A fake `stat` on PATH would otherwise report
+          # every planted binary as trustworthy.
+          STAT_BIN=""
+          for CANDIDATE in /usr/bin/stat /bin/stat; do
+            if [ -x "${CANDIDATE}" ]; then
+              STAT_BIN="${CANDIDATE}"
+              break
+            fi
+          done
+          if [ -z "${STAT_BIN}" ]; then
+            echo "::error title=Untrusted toolchain::No stat binary at /usr/bin/stat or /bin/stat."
+            exit 1
+          fi
+
+          # Sets RESOLVED_TOOL rather than printing it. Printing would mean
+          # calling this in a command substitution, which runs it in a subshell
+          # and swallows every diagnostic — including the error explaining why
+          # it failed.
+          RESOLVED_TOOL=""
           resolve_tool() {
             local NAME="$1"
             shift
-            local CANDIDATE
+            local CANDIDATE OWNER PERMS
+
             for CANDIDATE in "$@"; do
               [ -x "${CANDIDATE}" ] || continue
 
-              local OWNER
-              OWNER=$(stat -c '%U' "${CANDIDATE}")
+              OWNER=$("${STAT_BIN}" -c '%U' "${CANDIDATE}")
               if [ "${OWNER}" != "root" ]; then
-                echo "::error title=Untrusted tool::${CANDIDATE} is owned by ${OWNER}, not root. Refusing to run with write scopes."
-                exit 1
+                echo "  ${NAME}: ${CANDIDATE} is owned by ${OWNER}, not root."
+                return 1
               fi
 
-              local PERMS
-              PERMS=$(stat -c '%a' "${CANDIDATE}")
-              if [ $(( 0"${PERMS}" & 022 )) -ne 0 ]; then
-                echo "::error title=Untrusted tool::${CANDIDATE} is group- or world-writable (${PERMS}). Refusing to run with write scopes."
-                exit 1
+              PERMS=$("${STAT_BIN}" -c '%a' "${CANDIDATE}")
+              if [ $(( 0${PERMS} & 022 )) -ne 0 ]; then
+                echo "  ${NAME}: ${CANDIDATE} is group- or world-writable (${PERMS})."
+                return 1
               fi
 
               echo "  ${NAME}: ${CANDIDATE} (root, ${PERMS})"
-              printf '%s' "${CANDIDATE}"
+              RESOLVED_TOOL="${CANDIDATE}"
               return 0
             done
 
-            echo "::error title=Tool not found::Could not find a trusted ${NAME} at any expected absolute path."
-            exit 1
+            echo "  ${NAME}: no trusted binary at any expected absolute path: $*"
+            return 1
           }
 
-          GIT_BIN=$(resolve_tool git /usr/bin/git /bin/git)
-          GH_BIN=$(resolve_tool gh /usr/bin/gh /usr/local/bin/gh /opt/homebrew/bin/gh)
-          JQ_BIN=$(resolve_tool jq /usr/bin/jq /usr/local/bin/jq)
-          DATE_BIN=$(resolve_tool date /usr/bin/date /bin/date)
+          require_tool() {
+            local NAME="$1"
+            shift
+            if ! resolve_tool "${NAME}" "$@"; then
+              echo "::error title=Untrusted toolchain::${NAME} could not be resolved to a trusted absolute path. Investigate the runner before re-running."
+              exit 1
+            fi
+          }
+
+          require_tool git /usr/bin/git /bin/git
+          GIT_BIN="${RESOLVED_TOOL}"
+          require_tool gh /usr/bin/gh /usr/local/bin/gh /opt/hostedtoolcache/gh/gh /home/linuxbrew/.linuxbrew/bin/gh
+          GH_BIN="${RESOLVED_TOOL}"
+          require_tool jq /usr/bin/jq /usr/local/bin/jq
+          JQ_BIN="${RESOLVED_TOOL}"
+          require_tool date /usr/bin/date /bin/date
+          DATE_BIN="${RESOLVED_TOOL}"
 
           {
             echo "GIT_BIN=${GIT_BIN}"

@@ -257,6 +257,7 @@ extract_step "Resolve and create the release tag" "$STEPS_DIR/tag.sh"
 extract_step "Verify the notes cover the whole range" "$STEPS_DIR/verify.sh"
 extract_step "Create or update the release" "$STEPS_DIR/release.sh"
 extract_step "Report failure" "$STEPS_DIR/notify.sh"
+extract_step "Verify the toolchain" "$STEPS_DIR/tools.sh"
 
 TIP=1111111111111111111111111111111111111111
 OTHER=2222222222222222222222222222222222222222
@@ -415,13 +416,69 @@ assert_file_contains "$out" "skip=false"
 pass "fake git and jq earlier on PATH are never used"
 rm -f "$STUB_DIR/git" "$STUB_DIR/jq"
 
-# The preflight itself is fail-closed by construction.
-PREFLIGHT=$(awk '/^      - name: Verify the toolchain/,/^      - name: Gate/' "$WORKFLOW_FILE")
-printf '%s' "$PREFLIGHT" | grep -q "stat -c '%U'" || fail "preflight must check tool ownership"
-printf '%s' "$PREFLIGHT" | grep -q '& 022' || fail "preflight must reject group/world-writable tools"
-printf '%s' "$PREFLIGHT" | grep -q 'Tool not found' || fail "preflight must fail closed when a tool is missing"
-printf '%s' "$PREFLIGHT" | grep -q 'GIT_CONFIG_NOSYSTEM=1' || fail "preflight must neutralise system git config"
-pass "the toolchain preflight checks ownership, writability and fails closed"
+# The preflight's own logic, executed rather than grepped. The first version
+# of this step called resolve_tool inside a command substitution, which runs it
+# in a subshell: every diagnostic, including the error saying what went wrong,
+# was captured into the variable instead of printed, and the step failed with a
+# completely silent log. These tests exercise the real function.
+sed -n '/^RESOLVED_TOOL=""/,/^require_tool git/p' "$STEPS_DIR/tools.sh" | sed '$d' > "$TMP_ROOT/tool-funcs.sh"
+[ -s "$TMP_ROOT/tool-funcs.sh" ] || fail "could not extract the tool resolution functions"
+
+# A stat that reports whatever the test needs. In production STAT_BIN is
+# resolved to an absolute path before anything else, precisely so a planted
+# stat cannot vouch for a planted binary.
+cat > "$TMP_ROOT/fake-stat" <<'FAKESTAT'
+#!/usr/bin/env bash
+case "$2" in
+  '%U') echo "${FAKE_OWNER:-root}" ;;
+  '%a') echo "${FAKE_PERMS:-755}" ;;
+esac
+FAKESTAT
+chmod +x "$TMP_ROOT/fake-stat"
+
+TOOL_FIXTURE="$TMP_ROOT/fixture-tool"
+printf '#!/bin/sh
+' > "$TOOL_FIXTURE"
+chmod +x "$TOOL_FIXTURE"
+
+tool_case() {  # owner perms candidate -> prints "rc|resolved|output"
+  (
+    STAT_BIN="$TMP_ROOT/fake-stat"
+    export FAKE_OWNER="$1" FAKE_PERMS="$2"
+    # shellcheck disable=SC1090
+    . "$TMP_ROOT/tool-funcs.sh"
+    # Deliberately NOT a command substitution: that is the subshell trap this
+    # whole block exists to catch, and it would swallow RESOLVED_TOOL here too.
+    resolve_tool probe "$3" > "$TMP_ROOT/tool-out" 2>&1 && RC=0 || RC=$?
+    printf '%s|%s|%s' "$RC" "$RESOLVED_TOOL" "$(cat "$TMP_ROOT/tool-out")"
+  )
+}
+
+RESULT=$(tool_case root 755 "$TOOL_FIXTURE")
+[ "${RESULT%%|*}" = "0" ] || fail "a root-owned, non-writable tool should resolve: $RESULT"
+RESOLVED=$(printf '%s' "$RESULT" | cut -d'|' -f2)
+[ "$RESOLVED" = "$TOOL_FIXTURE" ]   || fail "RESOLVED_TOOL must be exactly the path, with no diagnostic text: '$RESOLVED'"
+printf '%s' "$RESULT" | cut -d'|' -f3- | grep -q 'probe:'   || fail "the success path must still report which binary it chose"
+pass "a trusted tool resolves to exactly its path, and still reports itself"
+
+RESULT=$(tool_case notroot 755 "$TOOL_FIXTURE")
+[ "${RESULT%%|*}" != "0" ] || fail "a non-root-owned tool must be rejected: $RESULT"
+printf '%s' "$RESULT" | grep -q 'is owned by notroot, not root'   || fail "rejection must say why, visibly: $RESULT"
+pass "a tool not owned by root is rejected, with a visible reason"
+
+RESULT=$(tool_case root 777 "$TOOL_FIXTURE")
+[ "${RESULT%%|*}" != "0" ] || fail "a world-writable tool must be rejected: $RESULT"
+printf '%s' "$RESULT" | grep -q 'group- or world-writable'   || fail "rejection must say why, visibly: $RESULT"
+pass "a group- or world-writable tool is rejected, with a visible reason"
+
+RESULT=$(tool_case root 755 "$TMP_ROOT/does-not-exist")
+[ "${RESULT%%|*}" != "0" ] || fail "a missing tool must be rejected: $RESULT"
+printf '%s' "$RESULT" | grep -q 'no trusted binary'   || fail "a missing tool must say so, visibly: $RESULT"
+pass "a missing tool fails closed, naming the paths it looked in"
+
+grep -q 'GIT_CONFIG_NOSYSTEM=1' "$STEPS_DIR/tools.sh"   || fail "preflight must neutralise system git config"
+grep -qE 'STAT_BIN=.*|/usr/bin/stat' "$STEPS_DIR/tools.sh"   || fail "stat itself must be resolved absolutely"
+pass "the preflight pins stat absolutely and neutralises system git config"
 
 grep -q 'persist-credentials: false' "$WORKFLOW_FILE" \
   || fail "checkout must not persist credentials into .git/config"
