@@ -1,0 +1,715 @@
+name: Production Release (reusable)
+
+# Central reusable workflow — lives in WebLime-agency/.github.
+# Produces a GitHub Release anchored to a production branch commit that is
+# PROVEN deployed: every workflow named in `required_deploy_workflows` must
+# have concluded `success` for that exact head_sha on the production branch.
+#
+# Design notes:
+#   - release-drafter ALWAYS runs with `dry-run: true`. This workflow owns
+#     release create/update, because on GitHub the action only ever updates a
+#     DRAFT (it looks for `releases.find(r => r.draft)` with no tag match), so
+#     a re-run against a published tag would take its create path and collide,
+#     and a leftover draft from an earlier SHA would be silently overwritten.
+#   - Tags are immutable: annotated, never moved. A movable deployment pointer
+#     such as `deployable-dev` is never used as release history.
+#   - Every `run:` step is a plain bash block, so
+#     tests/release-anchored-workflow.sh can extract and execute it against
+#     stubbed tooling.
+#
+# Hardening — this job holds `contents: write` and `issues: write` and may run
+# on a long-lived self-hosted runner shared with pull-request jobs from the
+# calling repository. Everything below assumes the workspace and PATH are
+# hostile:
+#   - A fresh checkout directory per run, removed first, never the reused
+#     workspace, so no `.git` from a previous job is inherited.
+#   - `persist-credentials: false`, and the tag is created through the API, so
+#     no token is ever written into a git config for a hook to steal.
+#   - Every git call disables hooks and fsmonitor and ignores system config,
+#     so a planted hook or `core.hooksPath` cannot execute.
+#   - Tooling resolved to verified absolute paths, never from PATH.
+#   - HEAD and a clean tree are verified after checkout.
+# The regression tests plant a hook, an fsmonitor config and a fake binary,
+# and prove none of them run.
+
+on:
+  workflow_call:
+    inputs:
+      required_deploy_workflows:
+        description: "Comma-separated workflow filenames that must have concluded success for the same production SHA."
+        required: true
+        type: string
+      sha:
+        description: "Explicit SHA to release. Blank resolves from the triggering event, then the production branch tip."
+        required: false
+        type: string
+        default: ""
+      mode:
+        description: "dry-run (write nothing) | draft | publish."
+        required: false
+        type: string
+        default: publish
+      tag_prefix:
+        description: "Prefix for release tags."
+        required: false
+        type: string
+        default: v
+      production_branch:
+        description: "Branch production is deployed from."
+        required: false
+        type: string
+        default: main
+      config_name:
+        description: "release-drafter config file, relative to .github/."
+        required: false
+        type: string
+        default: release-drafter.yml
+      max_commits:
+        description: "Refuse a range larger than this, rather than risk truncated notes."
+        required: false
+        type: number
+        default: 300
+      runner:
+        description: >-
+          JSON array for runs-on. Defaults to the shared self-hosted runner.
+          Pass '["ubuntu-latest"]' to run on an ephemeral hosted runner, which
+          removes the shared-runner threat model entirely at the cost of
+          Actions minutes on private repositories.
+        required: false
+        type: string
+        default: '["self-hosted", "Linux", "X64", "weblime-ci"]'
+
+permissions:
+  contents: write
+  # Required to read the deploy workflows' run conclusions. Without it the
+  # gate gets HTTP 403 and cannot tell a pending deploy from a successful one.
+  actions: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  # Both production deploy workflows completing will each trigger a caller run
+  # for the same SHA. Queue them; the second is a no-op via the tag check.
+  group: production-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    env:
+      # Unique per run and attempt, so nothing from a previous job on a shared
+      # runner is ever inherited.
+      CHECKOUT_DIR: .release-anchored/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Validate mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          case "${MODE}" in
+            dry-run|draft|publish)
+              echo "mode: ${MODE}"
+              ;;
+            *)
+              echo "::error title=Invalid mode::mode must be dry-run, draft or publish (got '${MODE}')."
+              exit 1
+              ;;
+          esac
+
+      - name: Verify the toolchain
+        id: tools
+        run: |
+          set -euo pipefail
+
+          # PATH is not trusted: a previous job on a shared runner can leave a
+          # fake `git`, `gh` or `jq` earlier on it. Resolve each tool to
+          # a fixed absolute path and fail closed unless it is owned by root and
+          # not group- or world-writable.
+          #
+          # `stat` is what does the verifying, so it is resolved absolutely too,
+          # before anything else. A fake `stat` on PATH would otherwise report
+          # every planted binary as trustworthy.
+          STAT_BIN=""
+          for CANDIDATE in /usr/bin/stat /bin/stat; do
+            if [ -x "${CANDIDATE}" ]; then
+              STAT_BIN="${CANDIDATE}"
+              break
+            fi
+          done
+          if [ -z "${STAT_BIN}" ]; then
+            echo "::error title=Untrusted toolchain::No stat binary at /usr/bin/stat or /bin/stat."
+            exit 1
+          fi
+
+          # Sets RESOLVED_TOOL rather than printing it. Printing would mean
+          # calling this in a command substitution, which runs it in a subshell
+          # and swallows every diagnostic — including the error explaining why
+          # it failed.
+          RESOLVED_TOOL=""
+          resolve_tool() {
+            local NAME="$1"
+            shift
+            local CANDIDATE OWNER PERMS
+
+            for CANDIDATE in "$@"; do
+              [ -x "${CANDIDATE}" ] || continue
+
+              OWNER=$("${STAT_BIN}" -c '%U' "${CANDIDATE}")
+              if [ "${OWNER}" != "root" ]; then
+                echo "  ${NAME}: ${CANDIDATE} is owned by ${OWNER}, not root."
+                return 1
+              fi
+
+              PERMS=$("${STAT_BIN}" -c '%a' "${CANDIDATE}")
+              if [ $(( 0${PERMS} & 022 )) -ne 0 ]; then
+                echo "  ${NAME}: ${CANDIDATE} is group- or world-writable (${PERMS})."
+                return 1
+              fi
+
+              echo "  ${NAME}: ${CANDIDATE} (root, ${PERMS})"
+              RESOLVED_TOOL="${CANDIDATE}"
+              return 0
+            done
+
+            echo "  ${NAME}: no trusted binary at any expected absolute path: $*"
+            return 1
+          }
+
+          require_tool() {
+            local NAME="$1"
+            shift
+            if ! resolve_tool "${NAME}" "$@"; then
+              echo "::error title=Untrusted toolchain::${NAME} could not be resolved to a trusted absolute path. Investigate the runner before re-running."
+              exit 1
+            fi
+          }
+
+          require_tool git /usr/bin/git /bin/git
+          GIT_BIN="${RESOLVED_TOOL}"
+          require_tool gh /usr/bin/gh /usr/local/bin/gh /opt/hostedtoolcache/gh/gh /home/linuxbrew/.linuxbrew/bin/gh
+          GH_BIN="${RESOLVED_TOOL}"
+          require_tool jq /usr/bin/jq /usr/local/bin/jq
+          JQ_BIN="${RESOLVED_TOOL}"
+          {
+            echo "GIT_BIN=${GIT_BIN}"
+            echo "GH_BIN=${GH_BIN}"
+            echo "JQ_BIN=${JQ_BIN}"
+            # Neutralises /etc/gitconfig and ~/.gitconfig, either of which a
+            # previous job could have written.
+            echo "GIT_CONFIG_NOSYSTEM=1"
+            # Every git call also passes -c core.hooksPath=/dev/null and
+            # -c core.fsmonitor=false, which override any remaining config.
+            echo "GIT_SAFE=${GIT_BIN} -c core.hooksPath=/dev/null -c core.fsmonitor=false"
+          } >> "${GITHUB_ENV}"
+
+      - name: Gate on a proven production deploy
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+          PRODUCTION_BRANCH: ${{ inputs.production_branch }}
+          REQUIRED_WORKFLOWS: ${{ inputs.required_deploy_workflows }}
+        run: |
+          set -euo pipefail
+
+          TIP=$("${GH_BIN}" api "repos/${REPO}/git/ref/heads/${PRODUCTION_BRANCH}" --jq '.object.sha')
+          echo "Current ${PRODUCTION_BRANCH} tip: ${TIP}"
+
+          CANDIDATE="${INPUT_SHA}"
+          SOURCE="workflow input"
+          if [ -z "${CANDIDATE}" ] && [ "${EVENT_NAME}" = "workflow_run" ]; then
+            CANDIDATE="${TRIGGER_SHA}"
+            SOURCE="triggering deploy run"
+          fi
+          if [ -z "${CANDIDATE}" ]; then
+            CANDIDATE="${TIP}"
+            SOURCE="${PRODUCTION_BRANCH} tip"
+          fi
+          echo "Candidate SHA (${SOURCE}): ${CANDIDATE}"
+
+          # Only the live production tip is ever released. A late-finishing or
+          # replayed deploy run must not produce a release for a superseded
+          # commit; its commits are covered by the next release's range, which
+          # starts from the previous release TAG rather than this SHA.
+          if [ "${CANDIDATE}" != "${TIP}" ]; then
+            if [ "${EVENT_NAME}" = "workflow_run" ]; then
+              echo "::notice title=Superseded commit::${CANDIDATE} is no longer the ${PRODUCTION_BRANCH} tip (${TIP}). Skipping; a later release covers it."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::error title=Not a production commit::${CANDIDATE} is not the current ${PRODUCTION_BRANCH} tip (${TIP}). Only the deployed production commit can be released."
+            exit 1
+          fi
+
+          PENDING=""
+          SUMMARY=""
+          IFS=',' read -r -a WORKFLOWS <<< "${REQUIRED_WORKFLOWS}"
+          for RAW in "${WORKFLOWS[@]}"; do
+            WORKFLOW="${RAW// /}"
+            [ -n "${WORKFLOW}" ] || continue
+
+            RUNS=$("${GH_BIN}" api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${PRODUCTION_BRANCH}&head_sha=${CANDIDATE}&per_page=20")
+
+            # Branch and head_sha alone are not enough: a pull-request run of
+            # the same workflow file, from a fork whose head branch is named
+            # `main`, would otherwise satisfy the gate. Require a run that came
+            # from this repository and from a push or a deliberate dispatch.
+            MATCH=$(printf '%s' "${RUNS}" | "${JQ_BIN}" -c --arg repo "${REPO}" '
+              [ .workflow_runs[]
+                | select(.head_repository.full_name == $repo)
+                | select(.event == "push" or .event == "workflow_dispatch")
+              ] | first // {}')
+
+            CONCLUSION=$(printf '%s' "${MATCH}" | "${JQ_BIN}" -r '.conclusion // "missing"')
+            RUN_URL=$(printf '%s' "${MATCH}" | "${JQ_BIN}" -r '.html_url // ""')
+
+            echo "  ${WORKFLOW}: ${CONCLUSION}"
+            SUMMARY="${SUMMARY}- \`${WORKFLOW}\`: ${CONCLUSION} ${RUN_URL}"$'\n'
+
+            if [ "${CONCLUSION}" != "success" ]; then
+              PENDING="${PENDING} ${WORKFLOW}(${CONCLUSION})"
+            fi
+          done
+
+          # A pending deploy is NOT a failure. The other workflow's completion
+          # re-triggers the caller; failing here would open a spurious issue on
+          # every deploy and teach everyone to ignore the alerts.
+          if [ -n "${PENDING}" ]; then
+            echo "::notice title=Production deploy not proven::Waiting on:${PENDING}. No-op; the remaining deploy workflow will re-trigger this."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "sha=${CANDIDATE}"
+            echo "deploy_summary<<GATE_SUMMARY_EOF"
+            printf '%s' "${SUMMARY}"
+            echo "GATE_SUMMARY_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare an isolated checkout directory
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          # actions/checkout reuses an existing .git directory, and neither
+          # `git clean` nor `git reset` touches .git/hooks or .git/config. On a
+          # shared runner a previous pull-request job can leave a hook or a
+          # core.hooksPath behind there. Start from an empty directory instead.
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "Prepared ${CHECKOUT_DIR}"
+
+      - name: Checkout the production commit
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.gate.outputs.sha }}
+          fetch-depth: 0
+          path: ${{ env.CHECKOUT_DIR }}
+          # The tag is created through the API, so nothing here needs a
+          # credential left behind in .git/config for a hook to steal.
+          persist-credentials: false
+
+      - name: Verify the checkout
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          HEAD_SHA=$(${GIT_SAFE} rev-parse HEAD)
+          if [ "${HEAD_SHA}" != "${SHA}" ]; then
+            echo "::error title=Unexpected checkout::HEAD is ${HEAD_SHA}, expected ${SHA}."
+            exit 1
+          fi
+
+          if [ -n "$(${GIT_SAFE} status --porcelain)" ]; then
+            echo "::error title=Dirty checkout::The working tree is not clean immediately after checkout."
+            ${GIT_SAFE} status --porcelain
+            exit 1
+          fi
+
+          # A hook planted in this fresh clone would have to have arrived with
+          # it; there should be none. Report rather than fail, since git ships
+          # .sample files.
+          HOOKS=$(find .git/hooks -type f ! -name '*.sample' 2>/dev/null || true)
+          if [ -n "${HOOKS}" ]; then
+            echo "::warning title=Unexpected git hooks::${HOOKS}"
+          fi
+
+          echo "Checkout verified at ${HEAD_SHA}, tree clean."
+
+      - name: Compute release range
+        id: range
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          MAX_COMMITS: ${{ inputs.max_commits }}
+        run: |
+          set -euo pipefail
+
+          # `${SHA}^` excludes a tag on the SHA itself, so that re-running
+          # against an already-released commit still finds the release before it.
+          PREV_TAG=$(${GIT_SAFE} describe --tags --abbrev=0 --match "${TAG_PREFIX}[0-9]*" "${SHA}^" 2>/dev/null || true)
+          TAG_AT_SHA=$(${GIT_SAFE} tag --points-at "${SHA}" --list "${TAG_PREFIX}[0-9]*" | head -n 1)
+
+          # The consequence of that `^`: a commit carrying the only release tag
+          # in the repository — the baseline, right after it is created — looks
+          # identical to a repository with no releases at all, and we would walk
+          # the entire history instead of reporting that production has not
+          # moved.
+          if [ -z "${PREV_TAG}" ] && [ -n "${TAG_AT_SHA}" ]; then
+            echo "::notice title=Nothing to release::${TAG_AT_SHA} already marks ${SHA} and there is no earlier release tag. Production has not moved since. No tag and no release created."
+            echo "- **Result:** nothing to release; ${TAG_AT_SHA} already marks this commit." >> "${GITHUB_STEP_SUMMARY}"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ -n "${PREV_TAG}" ]; then
+            RANGE="${PREV_TAG}..${SHA}"
+          else
+            RANGE="${SHA}"
+            echo "::warning title=No previous release tag::Walking the full history. Expect this only before the baseline release exists."
+          fi
+          echo "Range: ${RANGE}"
+
+          COMMITS=$(${GIT_SAFE} log --format=%H "${RANGE}")
+          COMMIT_COUNT=$(printf '%s' "${COMMITS}" | grep -c . || true)
+          echo "Commits in range: ${COMMIT_COUNT}"
+          ${GIT_SAFE} log --oneline "${RANGE}" || true
+
+          if [ "${COMMIT_COUNT}" -gt "${MAX_COMMITS}" ]; then
+            echo "::error title=Range too large::${COMMIT_COUNT} commits exceeds max_commits=${MAX_COMMITS}. Release notes would risk silent truncation; release a smaller range or raise the limit deliberately."
+            exit 1
+          fi
+
+          : > prs.ndjson
+          for COMMIT in ${COMMITS}; do
+            "${GH_BIN}" api "repos/${REPO}/commits/${COMMIT}/pulls" \
+              --jq '.[] | {number: .number, title: .title, labels: [.labels[].name]}' >> prs.ndjson
+          done
+          "${JQ_BIN}" -s 'unique_by(.number) | sort_by(.number)' prs.ndjson > prs.json
+
+          PR_COUNT=$("${JQ_BIN}" 'length' prs.json)
+          echo "Pull requests in range: ${PR_COUNT}"
+
+          # Expected = everything release-drafter should render. It excludes
+          # release/skip (exclude-labels) but keeps release/internal, which is
+          # rendered collapsed, and unlabelled PRs, which render uncategorised.
+          "${JQ_BIN}" -r '.[] | select(.labels | index("release/skip") | not) | .number' prs.json | sort -n -u > expected_prs.txt
+          EXPECTED_COUNT=$(grep -c . expected_prs.txt || true)
+
+          RELEASABLE=$("${JQ_BIN}" '[.[] | select((.labels | index("release/skip") | not) and (.labels | index("release/internal") | not))] | length' prs.json)
+          echo "Releasable (customer-visible or unlabelled): ${RELEASABLE}"
+
+          {
+            echo "## Release range"
+            echo
+            echo "- Production SHA: \`${SHA}\`"
+            echo "- Previous release tag: \`${PREV_TAG:-none}\`"
+            echo "- Commits: ${COMMIT_COUNT}"
+            echo "- Pull requests: ${PR_COUNT} (expected in notes: ${EXPECTED_COUNT})"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # An empty range, or one holding only skipped and internal work,
+          # produces no tag and no release. The next deploy's range starts from
+          # the previous release tag, so nothing is lost.
+          if [ "${RELEASABLE}" -eq 0 ]; then
+            echo "::notice title=Nothing to release::No customer-visible changes in ${RANGE}. No tag and no release created."
+            echo "- **Result:** nothing to release." >> "${GITHUB_STEP_SUMMARY}"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "prev_tag=${PREV_TAG}"
+            echo "commit_count=${COMMIT_COUNT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve and create the release tag
+        id: tag
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          # Re-running against an already-tagged SHA reuses its tag, which is
+          # what makes the whole workflow idempotent.
+          EXISTING=$(${GIT_SAFE} tag --points-at "${SHA}" --list "${TAG_PREFIX}[0-9]*" | head -n 1)
+
+          if [ -n "${EXISTING}" ]; then
+            TAG="${EXISTING}"
+            echo "Reusing existing tag ${TAG} at ${SHA}"
+          else
+            # Unpadded CalVer. Zero-padded months fail release-drafter's semver
+            # coercion, which silently drops our own previous releases from the
+            # candidate set and makes every run behave like the first.
+            # Dates come from bash's own strftime rather than /usr/bin/date:
+            # one fewer binary to trust on a shared runner. `%-m` is not
+            # supported here, so strip the padding with base-10 arithmetic —
+            # `10#` keeps `08` and `09` from being read as invalid octal.
+            TZ=UTC printf -v CAL_Y '%(%Y)T' -1
+            TZ=UTC printf -v CAL_M '%(%m)T' -1
+            TZ=UTC printf -v CAL_D '%(%d)T' -1
+            BASE="${TAG_PREFIX}${CAL_Y}.$((10#${CAL_M})).$((10#${CAL_D}))"
+            TAG="${BASE}"
+            SUFFIX=1
+            while ${GIT_SAFE} rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; do
+              SUFFIX=$((SUFFIX + 1))
+              TAG="${BASE}.${SUFFIX}"
+            done
+            echo "New tag: ${TAG}"
+          fi
+
+          POINTS_AT=$(${GIT_SAFE} rev-parse -q --verify "refs/tags/${TAG}^{commit}" 2>/dev/null || true)
+          if [ -n "${POINTS_AT}" ] && [ "${POINTS_AT}" != "${SHA}" ]; then
+            echo "::error title=Tag conflict::${TAG} already points at ${POINTS_AT}, not ${SHA}. Release tags are immutable and are never moved."
+            exit 1
+          fi
+
+          if [ "${MODE}" = "dry-run" ]; then
+            echo "[dry-run] would create annotated tag ${TAG} at ${SHA}"
+          elif [ -n "${EXISTING}" ]; then
+            echo "Tag ${TAG} already exists at ${SHA}; nothing to create."
+          else
+            # Created through the API rather than `git push`, so no credential
+            # is ever written into a git config where a planted hook could read
+            # it. Two calls: the annotated tag object, then the ref.
+            TAG_OBJECT=$("${GH_BIN}" api "repos/${REPO}/git/tags" \
+              -f tag="${TAG}" \
+              -f message="Release ${TAG}" \
+              -f object="${SHA}" \
+              -f type=commit \
+              --jq '.sha')
+
+            "${GH_BIN}" api "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="${TAG_OBJECT}" >/dev/null
+
+            echo "Created annotated tag ${TAG} (${TAG_OBJECT}) at ${SHA}"
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate release notes
+        id: notes
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        # Pinned to v7.7.0. `uses:` cannot take an expression, so this ref is
+        # literal by necessity; bump it deliberately.
+        uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9
+        with:
+          config-name: ${{ inputs.config_name }}
+          commitish: ${{ steps.gate.outputs.sha }}
+          tag: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          version: ${{ steps.tag.outputs.tag }}
+          dry-run: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify the notes cover the whole range
+        id: verify
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          BODY: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "${BODY}" > notes_body.md
+
+          # release-drafter's history-limit (15 pages) and pull-request-limit
+          # (5 associated PRs per commit) can truncate a long range silently. A
+          # short release is worse than a failed one, so compare its output
+          # against the set we computed ourselves.
+          #
+          # Match only release-drafter's own reference format from the shared
+          # change-template, `- $TITLE (#$NUMBER)`. Matching any `#N` would
+          # count an issue reference inside a PR title, such as "Fix #123", and
+          # report a mismatch that is not one.
+          grep -oE '\(#[0-9]+\)' notes_body.md | grep -oE '[0-9]+' | sort -n -u > notes_prs.txt || true
+
+          if ! diff -u expected_prs.txt notes_prs.txt > prs.diff; then
+            echo "::error title=Release notes do not match the commit range::release-drafter rendered a different set of pull requests than the range contains. Expected minus rendered shown below."
+            cat prs.diff
+            {
+              echo "### PR set mismatch"
+              echo
+              echo '```diff'
+              cat prs.diff
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          echo "Verified: $(grep -c . expected_prs.txt || true) pull requests, notes match the range."
+
+      - name: Create or update the release
+        id: release
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREV_TAG: ${{ steps.range.outputs.prev_tag }}
+          MODE: ${{ inputs.mode }}
+          DEPLOY_SUMMARY: ${{ steps.gate.outputs.deploy_summary }}
+          BODY: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          TZ=UTC printf -v DEPLOYED_AT '%(%Y-%m-%dT%H:%M:%SZ)T' -1
+
+          if [ -n "${PREV_TAG}" ]; then
+            COMPARE="https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
+          else
+            COMPARE="https://github.com/${REPO}/commits/${TAG}"
+          fi
+
+          # The header and compare link are built here, not in the config: only
+          # this job knows the deployed SHA and the deploy runs, and
+          # $RESOLVED_VERSION is the prefix-stripped version, not the tag.
+          {
+            echo "Production deploy of \`${SHA}\`."
+            echo
+            printf '%s' "${DEPLOY_SUMMARY}"
+            echo
+            printf '%s\n' "${BODY}"
+            echo
+            echo "**Full changelog:** ${COMPARE}"
+          } > release_body.md
+
+          # The machine-readable payload carries ONLY customer-facing work.
+          # Internal and security lines stay in the prose body, so a downstream
+          # marketing consumer cannot leak them by reading the wrong section.
+          "${JQ_BIN}" \
+            --arg tag "${TAG}" \
+            --arg sha "${SHA}" \
+            --arg deployed_at "${DEPLOYED_AT}" \
+            --arg compare_url "${COMPARE}" \
+            '{
+              tag: $tag,
+              sha: $sha,
+              deployed_at: $deployed_at,
+              compare_url: $compare_url,
+              categories: {
+                new:      [.[] | select(.labels | index("release/new"))      | {title: .title, pr: .number}],
+                improved: [.[] | select(.labels | index("release/improved")) | {title: .title, pr: .number}],
+                fixed:    [.[] | select(.labels | index("release/fixed"))    | {title: .title, pr: .number}],
+                api:      [.[] | select(.labels | index("release/api"))      | {title: .title, pr: .number}]
+              }
+            }' prs.json > release.json
+
+          if [ "${MODE}" = "dry-run" ]; then
+            {
+              echo "### Release body (dry-run — nothing was written)"
+              echo
+              cat release_body.md
+              echo
+              echo "### release.json"
+              echo
+              echo '```json'
+              cat release.json
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "[dry-run] would publish ${TAG} at ${SHA}"
+            exit 0
+          fi
+
+          CREATE_ARGS=()
+          if [ "${MODE}" = "draft" ]; then
+            CREATE_ARGS+=(--draft)
+          fi
+
+          if "${GH_BIN}" release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; updating in place."
+            "${GH_BIN}" release edit "${TAG}" --title "${TAG}" --notes-file release_body.md
+          else
+            "${GH_BIN}" release create "${TAG}" --title "${TAG}" --notes-file release_body.md --target "${SHA}" "${CREATE_ARGS[@]}"
+          fi
+
+          "${GH_BIN}" release upload "${TAG}" release.json --clobber
+
+          # The release exists by this point. A cosmetic summary line must not
+          # be able to fail the step and open a failure issue for a release
+          # that actually succeeded.
+          {
+            echo "### Released ${TAG}"
+            "${GH_BIN}" release view "${TAG}" --json url --jq '.url' || echo "(release URL unavailable)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clean up the isolated checkout
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "${CHECKOUT_DIR}" || true
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          MODE: ${{ inputs.mode }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Production release failed"
+            echo
+            echo "- **Production SHA:** \`${SHA:-not resolved}\`"
+            echo "- **Tag:** \`${TAG:-not resolved}\`"
+            echo "- **Mode:** \`${MODE}\`"
+            echo "- **Run:** ${RUN_URL}"
+            echo
+            echo "Common causes:"
+            echo
+            echo "- **PR set mismatch** — release-drafter rendered a different set of pull requests than the range contains. Check its truncation limits before trusting the notes."
+            echo "- **Tag conflict** — the tag already points at another commit. Release tags are immutable; do not force. This usually means history was rewritten."
+            echo "- **Range too large** — raise \`max_commits\` deliberately, or release a smaller range."
+            echo "- **Untrusted toolchain** — a required tool was missing, not owned by root, or group/world-writable on the runner. Investigate the runner before re-running."
+            echo
+            echo "Re-run with the explicit SHA once fixed. The workflow is idempotent: an existing tag is reused and an existing release is edited in place."
+          } > issue_body.md
+
+          TZ=UTC printf -v TODAY '%(%Y-%m-%d)T' -1
+
+          # The alert must not fail because its own label is missing. gh
+          # validates labels before creating anything, so an absent label means
+          # no issue at all — at exactly the moment one is most needed.
+          LABEL_ARGS=()
+          if "${GH_BIN:-gh}" label list --repo "${REPO}" --search release-automation --json name --jq '.[].name' \
+            | grep -qx 'release-automation'; then
+            LABEL_ARGS+=(--label release-automation)
+          else
+            echo "::warning title=Missing label::release-automation does not exist in ${REPO}; opening the alert unlabelled. Run scripts/sync-release-labels.sh."
+          fi
+
+          "${GH_BIN:-gh}" issue create \
+            --repo "${REPO}" \
+            --title "Production release failed (${TODAY})" \
+            --body-file issue_body.md \
+            "${LABEL_ARGS[@]}"
