@@ -24,11 +24,18 @@ name: Production Release (reusable)
 #   - A fresh checkout directory per run, removed first, never the reused
 #     workspace, so no `.git` from a previous job is inherited.
 #   - `persist-credentials: false`, and the tag is created through the API, so
-#     no token is ever written into a git config for a hook to steal.
-#   - Every git call disables hooks and fsmonitor and ignores system config,
-#     so a planted hook or `core.hooksPath` cannot execute.
-#   - Tooling resolved to verified absolute paths, never from PATH.
+#     no token is left in a git config after checkout for a hook to steal.
+#   - Every git call disables hooks and fsmonitor and ignores system config.
+#     ~/.gitconfig and ~/.config/gh are swapped for fresh, empty per-run
+#     copies before actions/checkout runs, so a planted `core.hooksPath` or gh
+#     setting reaches neither the checkout, while it briefly holds the token
+#     in .git/config, nor any later step.
+#   - git, gh and jq resolved to verified absolute paths, never from PATH.
+#     Every step pins PATH to /usr/bin:/bin for everything else, and
+#     /usr/bin is put first on PATH for actions/checkout.
 #   - HEAD and a clean tree are verified after checkout.
+#   - The tag is created only after the notes are verified, so a failed run
+#     never leaves a release tag behind that would swallow its range.
 # The regression tests plant a hook, an fsmonitor config and a fake binary,
 # and prove none of them run.
 
@@ -107,6 +114,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           case "${MODE}" in
             dry-run|draft|publish)
@@ -122,6 +130,7 @@ jobs:
         id: tools
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           # PATH is not trusted: a previous job on a shared runner can leave a
           # fake `git`, `gh` or `jq` earlier on it. Resolve each tool to
@@ -192,13 +201,47 @@ jobs:
           GH_BIN="${RESOLVED_TOOL}"
           require_tool jq /usr/bin/jq /usr/local/bin/jq
           JQ_BIN="${RESOLVED_TOOL}"
+
+          # GIT_CONFIG_GLOBAL, below, arrived in git 2.32. Older git ignores it
+          # silently, which would leave ~/.gitconfig live: fail closed instead.
+          GIT_VERSION=$("${GIT_BIN}" version)
+          if ! [[ "${GIT_VERSION}" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] \
+            || [ "${BASH_REMATCH[1]}" -lt 2 ] \
+            || { [ "${BASH_REMATCH[1]}" -eq 2 ] && [ "${BASH_REMATCH[2]}" -lt 32 ]; }; then
+            echo "::error title=Untrusted toolchain::${GIT_VERSION} is older than 2.32 and cannot isolate ~/.gitconfig."
+            exit 1
+          fi
+
+          # A previous job can write ~/.gitconfig (a core.hooksPath would run
+          # during actions/checkout's own checkout, while the token is still in
+          # .git/config) or ~/.config/gh (aliases, http_unix_socket). Replace
+          # both with fresh, empty per-run copies. An empty file rather than
+          # /dev/null for git, because actions/checkout writes safe.directory
+          # with `git config --global` and fails if it cannot.
+          ISOLATED_HOME="${RUNNER_TEMP}/release-anchored-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "${ISOLATED_HOME}"
+          mkdir -m 700 "${ISOLATED_HOME}"
+          mkdir -m 700 "${ISOLATED_HOME}/gh"
+          : > "${ISOLATED_HOME}/gitconfig"
+
+          # actions/checkout finds git on PATH. Put the verified binaries'
+          # directories first so it runs the same git; later lines are
+          # prepended ahead of earlier ones, so /usr/bin ends up first.
+          {
+            echo "/bin"
+            echo "/usr/bin"
+          } >> "${GITHUB_PATH}"
+
           {
             echo "GIT_BIN=${GIT_BIN}"
             echo "GH_BIN=${GH_BIN}"
             echo "JQ_BIN=${JQ_BIN}"
-            # Neutralises /etc/gitconfig and ~/.gitconfig, either of which a
-            # previous job could have written.
+            echo "ISOLATED_HOME=${ISOLATED_HOME}"
+            # GIT_CONFIG_NOSYSTEM skips /etc/gitconfig; GIT_CONFIG_GLOBAL
+            # replaces ~/.gitconfig. Both apply to actions/checkout too.
             echo "GIT_CONFIG_NOSYSTEM=1"
+            echo "GIT_CONFIG_GLOBAL=${ISOLATED_HOME}/gitconfig"
+            echo "GH_CONFIG_DIR=${ISOLATED_HOME}/gh"
             # Every git call also passes -c core.hooksPath=/dev/null and
             # -c core.fsmonitor=false, which override any remaining config.
             echo "GIT_SAFE=${GIT_BIN} -c core.hooksPath=/dev/null -c core.fsmonitor=false"
@@ -216,6 +259,7 @@ jobs:
           REQUIRED_WORKFLOWS: ${{ inputs.required_deploy_workflows }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           TIP=$("${GH_BIN}" api "repos/${REPO}/git/ref/heads/${PRODUCTION_BRANCH}" --jq '.object.sha')
           echo "Current ${PRODUCTION_BRANCH} tip: ${TIP}"
@@ -297,6 +341,7 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           # actions/checkout reuses an existing .git directory, and neither
           # `git clean` nor `git reset` touches .git/hooks or .git/config. On a
@@ -324,6 +369,7 @@ jobs:
           SHA: ${{ steps.gate.outputs.sha }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           HEAD_SHA=$(${GIT_SAFE} rev-parse HEAD)
           if [ "${HEAD_SHA}" != "${SHA}" ]; then
@@ -359,6 +405,7 @@ jobs:
           MAX_COMMITS: ${{ inputs.max_commits }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           # `${SHA}^` excludes a tag on the SHA itself, so that re-running
           # against an already-released commit still finds the release before it.
@@ -439,18 +486,20 @@ jobs:
             echo "commit_count=${COMMIT_COUNT}"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Resolve and create the release tag
+      - name: Resolve the release tag
         id: tag
         if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
         working-directory: ${{ env.CHECKOUT_DIR }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
           SHA: ${{ steps.gate.outputs.sha }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
-          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
+
+          # Only the name is resolved here. The tag itself is created after the
+          # notes are verified: a tag left behind by a failed run would become
+          # the next run's range start, and its commits would never get notes.
 
           # Re-running against an already-tagged SHA reuses its tag, which is
           # what makes the whole workflow idempotent.
@@ -464,12 +513,12 @@ jobs:
             # coercion, which silently drops our own previous releases from the
             # candidate set and makes every run behave like the first.
             # Dates come from bash's own strftime rather than /usr/bin/date:
-            # one fewer binary to trust on a shared runner. `%-m` is not
-            # supported here, so strip the padding with base-10 arithmetic —
-            # `10#` keeps `08` and `09` from being read as invalid octal.
-            TZ=UTC printf -v CAL_Y '%(%Y)T' -1
-            TZ=UTC printf -v CAL_M '%(%m)T' -1
-            TZ=UTC printf -v CAL_D '%(%d)T' -1
+            # one fewer binary to trust on a shared runner. Formatted once, so
+            # the parts cannot straddle midnight. `%-m` is not supported here,
+            # so strip the padding with base-10 arithmetic — `10#` keeps `08`
+            # and `09` from being read as invalid octal.
+            TZ=UTC printf -v CAL_TODAY '%(%Y %m %d)T' -1
+            read -r CAL_Y CAL_M CAL_D <<< "${CAL_TODAY}"
             BASE="${TAG_PREFIX}${CAL_Y}.$((10#${CAL_M})).$((10#${CAL_D}))"
             TAG="${BASE}"
             SUFFIX=1
@@ -486,29 +535,14 @@ jobs:
             exit 1
           fi
 
-          if [ "${MODE}" = "dry-run" ]; then
-            echo "[dry-run] would create annotated tag ${TAG} at ${SHA}"
-          elif [ -n "${EXISTING}" ]; then
-            echo "Tag ${TAG} already exists at ${SHA}; nothing to create."
-          else
-            # Created through the API rather than `git push`, so no credential
-            # is ever written into a git config where a planted hook could read
-            # it. Two calls: the annotated tag object, then the ref.
-            TAG_OBJECT=$("${GH_BIN}" api "repos/${REPO}/git/tags" \
-              -f tag="${TAG}" \
-              -f message="Release ${TAG}" \
-              -f object="${SHA}" \
-              -f type=commit \
-              --jq '.sha')
-
-            "${GH_BIN}" api "repos/${REPO}/git/refs" \
-              -f ref="refs/tags/${TAG}" \
-              -f sha="${TAG_OBJECT}" >/dev/null
-
-            echo "Created annotated tag ${TAG} (${TAG_OBJECT}) at ${SHA}"
-          fi
-
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "tag=${TAG}"
+            if [ -n "${EXISTING}" ]; then
+              echo "exists=true"
+            else
+              echo "exists=false"
+            fi
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Generate release notes
         id: notes
@@ -534,6 +568,7 @@ jobs:
           BODY: ${{ steps.notes.outputs.body }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           printf '%s\n' "${BODY}" > notes_body.md
 
@@ -563,6 +598,43 @@ jobs:
 
           echo "Verified: $(grep -c . expected_prs.txt || true) pull requests, notes match the range."
 
+      - name: Create the release tag
+        id: create_tag
+        if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          EXISTS: ${{ steps.tag.outputs.exists }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+
+          if [ "${MODE}" = "dry-run" ]; then
+            echo "[dry-run] would create annotated tag ${TAG} at ${SHA}"
+          elif [ "${EXISTS}" = "true" ]; then
+            echo "Tag ${TAG} already exists at ${SHA}; nothing to create."
+          else
+            # Created through the API rather than `git push`, so no credential
+            # is ever written into a git config where a planted hook could read
+            # it. Two calls: the annotated tag object, then the ref.
+            TAG_OBJECT=$("${GH_BIN}" api "repos/${REPO}/git/tags" \
+              -f tag="${TAG}" \
+              -f message="Release ${TAG}" \
+              -f object="${SHA}" \
+              -f type=commit \
+              --jq '.sha')
+
+            "${GH_BIN}" api "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="${TAG_OBJECT}" >/dev/null
+
+            echo "Created annotated tag ${TAG} (${TAG_OBJECT}) at ${SHA}"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Create or update the release
         id: release
         if: steps.gate.outputs.skip != 'true' && steps.range.outputs.skip != 'true'
@@ -578,6 +650,7 @@ jobs:
           BODY: ${{ steps.notes.outputs.body }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
 
           TZ=UTC printf -v DEPLOYED_AT '%(%Y-%m-%dT%H:%M:%SZ)T' -1
 
@@ -659,12 +732,6 @@ jobs:
             "${GH_BIN}" release view "${TAG}" --json url --jq '.url' || echo "(release URL unavailable)"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Clean up the isolated checkout
-        if: always()
-        run: |
-          set -euo pipefail
-          rm -rf "${CHECKOUT_DIR}" || true
-
       - name: Report failure
         if: failure()
         env:
@@ -672,16 +739,33 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ steps.gate.outputs.sha }}
           TAG: ${{ steps.tag.outputs.tag }}
+          TAG_CREATED: ${{ steps.create_tag.outputs.created }}
           MODE: ${{ inputs.mode }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          export PATH=/usr/bin:/bin
+
+          # GH_BIN is only set once the toolchain preflight has verified gh.
+          # Without it there is no trustworthy gh to hand an issues: write token
+          # to, so fail closed rather than fall back to whatever gh is on PATH.
+          # The failed run itself is the alert in that case.
+          if [ -z "${GH_BIN:-}" ]; then
+            echo "::error title=Alert not sent::The toolchain preflight did not complete, so there is no verified gh to open the failure issue with. Investigate the runner before re-running."
+            exit 1
+          fi
+
+          if [ -n "${TAG:-}" ] && [ "${TAG_CREATED:-}" != "true" ]; then
+            TAG_LINE="\`${TAG}\` (resolved; not created by this run)"
+          else
+            TAG_LINE="\`${TAG:-not resolved}\`"
+          fi
 
           {
             echo "## Production release failed"
             echo
             echo "- **Production SHA:** \`${SHA:-not resolved}\`"
-            echo "- **Tag:** \`${TAG:-not resolved}\`"
+            echo "- **Tag:** ${TAG_LINE}"
             echo "- **Mode:** \`${MODE}\`"
             echo "- **Run:** ${RUN_URL}"
             echo
@@ -690,7 +774,6 @@ jobs:
             echo "- **PR set mismatch** — release-drafter rendered a different set of pull requests than the range contains. Check its truncation limits before trusting the notes."
             echo "- **Tag conflict** — the tag already points at another commit. Release tags are immutable; do not force. This usually means history was rewritten."
             echo "- **Range too large** — raise \`max_commits\` deliberately, or release a smaller range."
-            echo "- **Untrusted toolchain** — a required tool was missing, not owned by root, or group/world-writable on the runner. Investigate the runner before re-running."
             echo
             echo "Re-run with the explicit SHA once fixed. The workflow is idempotent: an existing tag is reused and an existing release is edited in place."
           } > issue_body.md
@@ -701,15 +784,25 @@ jobs:
           # validates labels before creating anything, so an absent label means
           # no issue at all — at exactly the moment one is most needed.
           LABEL_ARGS=()
-          if "${GH_BIN:-gh}" label list --repo "${REPO}" --search release-automation --json name --jq '.[].name' \
+          if "${GH_BIN}" label list --repo "${REPO}" --search release-automation --json name --jq '.[].name' \
             | grep -qx 'release-automation'; then
             LABEL_ARGS+=(--label release-automation)
           else
             echo "::warning title=Missing label::release-automation does not exist in ${REPO}; opening the alert unlabelled. Run scripts/sync-release-labels.sh."
           fi
 
-          "${GH_BIN:-gh}" issue create \
+          "${GH_BIN}" issue create \
             --repo "${REPO}" \
             --title "Production release failed (${TODAY})" \
             --body-file issue_body.md \
             "${LABEL_ARGS[@]}"
+
+      - name: Clean up the isolated checkout
+        if: always()
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+          rm -rf "${CHECKOUT_DIR}" || true
+          if [ -n "${ISOLATED_HOME:-}" ]; then
+            rm -rf "${ISOLATED_HOME}" || true
+          fi

@@ -251,7 +251,8 @@ install_stubs
 extract_step "Gate on a proven production deploy" "$STEPS_DIR/gate.sh"
 extract_step "Verify the checkout" "$STEPS_DIR/verify-checkout.sh"
 extract_step "Compute release range" "$STEPS_DIR/range.sh"
-extract_step "Resolve and create the release tag" "$STEPS_DIR/tag.sh"
+extract_step "Resolve the release tag" "$STEPS_DIR/tag.sh"
+extract_step "Create the release tag" "$STEPS_DIR/create-tag.sh"
 extract_step "Verify the notes cover the whole range" "$STEPS_DIR/verify.sh"
 extract_step "Create or update the release" "$STEPS_DIR/release.sh"
 extract_step "Report failure" "$STEPS_DIR/notify.sh"
@@ -371,11 +372,15 @@ out=$(new_github_output)
 GH_CALL_LOG="$TMP_ROOT/gh-calls.log"
 : > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/harden-hooks.log" \
+  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v"
+HOOK_TAG=$(grep '^tag=' "$out" | cut -d= -f2)
+run_step_ok "$STEPS_DIR/create-tag.sh" "$TMP_ROOT/harden-hooks-create.log" \
   "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
-  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG=$HOOK_TAG" "EXISTS=false" "MODE=publish"
 assert_no_marker pre-push "a planted pre-push hook"
 assert_no_marker post-checkout "a planted post-checkout hook"
 assert_file_not_contains "$TMP_ROOT/harden-hooks.log" "git push"
+assert_file_not_contains "$TMP_ROOT/harden-hooks-create.log" "git push"
 pass "planted git hooks never execute; the tag is created without a push"
 
 # The tag is created through the API, so no credential is written into any git
@@ -400,19 +405,46 @@ echo "fake jq executed" > "$MARKER_DIR/fake-jq"
 exit 0
 EVIL
 chmod +x "$STUB_DIR/jq"
+# Everything else the token-holding steps call resolves from PATH, so every
+# step pins PATH to /usr/bin:/bin. A planted coreutil must not run either.
+FAKE_UTILS="grep sort head find diff cat rm"
+for U in $FAKE_UTILS; do
+  cat > "$STUB_DIR/$U" <<EVIL
+#!/usr/bin/env bash
+echo "fake $U executed" > "$MARKER_DIR/fake-$U"
+exit 0
+EVIL
+  chmod +x "$STUB_DIR/$U"
+done
 
 out=$(new_github_output)
 summary="$TMP_ROOT/summary.md"
 : > "$summary"
+run_step_ok "$STEPS_DIR/verify-checkout.sh" "$TMP_ROOT/harden-path-checkout.log" \
+  "SHA=$HEAD_SHA"
 run_step_ok "$STEPS_DIR/range.sh" "$TMP_ROOT/harden-path.log" \
   "GITHUB_OUTPUT=$out" "GITHUB_STEP_SUMMARY=$summary" \
   "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MAX_COMMITS=300" \
   "STUB_COMMIT_PULLS=[{\"number\":7,\"title\":\"Add a thing\",\"labels\":[{\"name\":\"release/new\"}]}]"
+printf '7\n' > "$WORK_DIR/expected_prs.txt"
+run_step_ok "$STEPS_DIR/verify.sh" "$TMP_ROOT/harden-path-verify.log" \
+  "BODY=- Add a thing (#7)"
 assert_no_marker fake-git "a fake git earlier on PATH"
 assert_no_marker fake-jq "a fake jq earlier on PATH"
+for U in $FAKE_UTILS; do
+  assert_no_marker "fake-$U" "a fake $U earlier on PATH"
+done
 assert_file_contains "$out" "skip=false"
-pass "fake git and jq earlier on PATH are never used"
+assert_file_contains "$TMP_ROOT/harden-path-verify.log" "Verified"
+pass "fake git, jq and coreutils earlier on PATH are never used"
 rm -f "$STUB_DIR/git" "$STUB_DIR/jq"
+for U in $FAKE_UTILS; do rm -f "$STUB_DIR/$U"; done
+
+RUN_BLOCKS=$(grep -c '^        run: |$' "$WORKFLOW_FILE")
+PINNED=$(grep -A2 '^        run: |$' "$WORKFLOW_FILE" | grep -c '^          export PATH=/usr/bin:/bin$')
+[ "$RUN_BLOCKS" -eq "$PINNED" ] \
+  || fail "every run step must pin PATH first ($PINNED of $RUN_BLOCKS do)"
+pass "every run step pins PATH to /usr/bin:/bin before doing anything"
 
 # The preflight's own logic, executed rather than grepped. The first version
 # of this step called resolve_tool inside a command substitution, which runs it
@@ -476,9 +508,39 @@ pass "a missing tool fails closed, naming the paths it looked in"
 
 grep -q 'GIT_CONFIG_NOSYSTEM=1' "$STEPS_DIR/tools.sh"   || fail "preflight must neutralise system git config"
 grep -q 'DATE_BIN' "$STEPS_DIR/tools.sh"   && fail "the workflow must not depend on /usr/bin/date; use bash strftime"
-grep -q "printf -v CAL_Y" "$STEPS_DIR/tag.sh"   || fail "the CalVer tag must come from bash strftime, not an external binary"
+grep -q "printf -v CAL_TODAY" "$STEPS_DIR/tag.sh"   || fail "the CalVer tag must come from bash strftime, not an external binary"
+[ "$(grep -c "printf -v CAL_" "$STEPS_DIR/tag.sh")" -eq 1 ] \
+  || fail "the CalVer date must be formatted once, so its parts cannot straddle midnight"
 grep -qE 'STAT_BIN=.*|/usr/bin/stat' "$STEPS_DIR/tools.sh"   || fail "stat itself must be resolved absolutely"
 pass "the preflight pins stat absolutely and neutralises system git config"
+
+grep -q 'GIT_CONFIG_GLOBAL=${ISOLATED_HOME}/gitconfig' "$STEPS_DIR/tools.sh" \
+  || fail "preflight must replace ~/.gitconfig with a fresh per-run file"
+grep -q 'GH_CONFIG_DIR=${ISOLATED_HOME}/gh' "$STEPS_DIR/tools.sh" \
+  || fail "preflight must point gh at a fresh per-run config directory"
+grep -q 'GITHUB_PATH' "$STEPS_DIR/tools.sh" \
+  || fail "preflight must put the verified git first on PATH for actions/checkout"
+TOOLS_LINE=$(grep -n '      - name: Verify the toolchain$' "$WORKFLOW_FILE" | cut -d: -f1)
+CHECKOUT_LINE=$(grep -n 'uses: actions/checkout@' "$WORKFLOW_FILE" | cut -d: -f1)
+[ "$TOOLS_LINE" -lt "$CHECKOUT_LINE" ] \
+  || fail "global git config must be neutralised before actions/checkout runs"
+pass "~/.gitconfig and gh config are isolated before actions/checkout runs"
+
+# GIT_CONFIG_GLOBAL is silently ignored before git 2.32, which would leave
+# ~/.gitconfig live. The preflight must refuse such a git.
+sed -n '/^GIT_VERSION=/,/^fi$/p' "$STEPS_DIR/tools.sh" > "$TMP_ROOT/git-version-check.sh"
+[ -s "$TMP_ROOT/git-version-check.sh" ] || fail "could not extract the git version check"
+git_version_case() {
+  printf '#!/bin/sh\necho "git version %s"\n' "$1" > "$TMP_ROOT/fake-git-version"
+  chmod +x "$TMP_ROOT/fake-git-version"
+  GIT_BIN="$TMP_ROOT/fake-git-version" bash -c "set -euo pipefail; . '$TMP_ROOT/git-version-check.sh'" > /dev/null 2>&1
+}
+git_version_case 2.31.8 && fail "git 2.31 must be refused: it ignores GIT_CONFIG_GLOBAL"
+git_version_case 1.9.5 && fail "git 1.x must be refused"
+git_version_case 2.32.0 || fail "git 2.32 must be accepted"
+git_version_case 2.43.0 || fail "git 2.43 must be accepted"
+git_version_case 3.0.0 || fail "git 3.0 must be accepted"
+pass "a git too old to honour GIT_CONFIG_GLOBAL fails the preflight closed"
 
 grep -q 'persist-credentials: false' "$WORKFLOW_FILE" \
   || fail "checkout must not persist credentials into .git/config"
@@ -554,24 +616,46 @@ setup_repo
 HEAD_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD)
 PARENT_SHA=$("$REAL_GIT" -C "$WORK_DIR" rev-parse HEAD^)
 
+# Resolving the name must never touch the remote: the tag is only created after
+# the notes are verified, so a failed verify cannot leave a tag behind that the
+# next run would treat as its range start.
 out=$(new_github_output)
 : > "$GH_CALL_LOG"
-run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-dryrun.log" \
+run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-resolve.log" \
   "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
-  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=dry-run"
-assert_file_contains "$TMP_ROOT/tag-dryrun.log" "[dry-run] would create annotated tag"
-assert_file_not_contains "$GH_CALL_LOG" "git/tags"
-pass "dry-run resolves a tag name without creating it"
+  "SHA=$HEAD_SHA" "TAG_PREFIX=v"
+TAG_NAME=$(grep '^tag=' "$out" | cut -d= -f2)
+[ -n "$TAG_NAME" ] || fail "tag step must output a tag name"
+assert_file_contains "$out" "exists=false"
+[ -s "$GH_CALL_LOG" ] && fail "resolving the tag name must not call the API"
+pass "resolving the tag name creates nothing"
+
+RESOLVE_LINE=$(grep -n '      - name: Resolve the release tag$' "$WORKFLOW_FILE" | cut -d: -f1)
+VERIFY_LINE=$(grep -n '      - name: Verify the notes cover the whole range$' "$WORKFLOW_FILE" | cut -d: -f1)
+CREATE_LINE=$(grep -n '      - name: Create the release tag$' "$WORKFLOW_FILE" | cut -d: -f1)
+RELEASE_LINE=$(grep -n '      - name: Create or update the release$' "$WORKFLOW_FILE" | cut -d: -f1)
+[ "$RESOLVE_LINE" -lt "$VERIFY_LINE" ] && [ "$VERIFY_LINE" -lt "$CREATE_LINE" ] && [ "$CREATE_LINE" -lt "$RELEASE_LINE" ] \
+  || fail "the tag must be created after the notes are verified and before the release"
+pass "the tag is created only after the notes are verified"
 
 out=$(new_github_output)
 : > "$GH_CALL_LOG"
-run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-create.log" \
+run_step_ok "$STEPS_DIR/create-tag.sh" "$TMP_ROOT/tag-dryrun.log" \
   "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
-  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG=$TAG_NAME" "EXISTS=false" "MODE=dry-run"
+assert_file_contains "$TMP_ROOT/tag-dryrun.log" "[dry-run] would create annotated tag"
+assert_file_not_contains "$GH_CALL_LOG" "git/tags"
+assert_file_not_contains "$out" "created=true"
+pass "dry-run creates no tag"
+
+out=$(new_github_output)
+: > "$GH_CALL_LOG"
+run_step_ok "$STEPS_DIR/create-tag.sh" "$TMP_ROOT/tag-create.log" \
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG=$TAG_NAME" "EXISTS=false" "MODE=publish"
 assert_file_contains "$GH_CALL_LOG" "-f type=commit"
 assert_file_contains "$GH_CALL_LOG" "api repos/acme/app/git/refs"
-TAG_NAME=$(grep '^tag=' "$out" | cut -d= -f2)
-[ -n "$TAG_NAME" ] || fail "tag step must output a tag name"
+assert_file_contains "$out" "created=true"
 pass "publish mode creates an annotated tag object and its ref via the API"
 
 # The tag now exists remotely but not locally, which is what a re-run sees
@@ -580,22 +664,25 @@ pass "publish mode creates an annotated tag object and its ref via the API"
 out=$(new_github_output)
 : > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-rerun.log" \
-  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
-  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v"
 assert_file_contains "$TMP_ROOT/tag-rerun.log" "Reusing existing tag"
 assert_file_contains "$out" "tag=$TAG_NAME"
+assert_file_contains "$out" "exists=true"
+run_step_ok "$STEPS_DIR/create-tag.sh" "$TMP_ROOT/tag-rerun-create.log" \
+  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
+  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG=$TAG_NAME" "EXISTS=true" "MODE=publish"
 assert_file_not_contains "$GH_CALL_LOG" "git/tags"
 pass "re-running against an already-tagged SHA reuses it and creates nothing"
 
 "$REAL_GIT" -C "$WORK_DIR" tag -d "$TAG_NAME" >/dev/null
-TZ=UTC printf -v CAL_Y '%(%Y)T' -1; TZ=UTC printf -v CAL_M '%(%m)T' -1; TZ=UTC printf -v CAL_D '%(%d)T' -1
+TZ=UTC printf -v CAL_TODAY '%(%Y %m %d)T' -1
+read -r CAL_Y CAL_M CAL_D <<< "$CAL_TODAY"
 BASE_TAG="v${CAL_Y}.$((10#${CAL_M})).$((10#${CAL_D}))"
 "$REAL_GIT" -C "$WORK_DIR" tag -a "$BASE_TAG" -m "wrong place" "$PARENT_SHA"
 out=$(new_github_output)
 : > "$GH_CALL_LOG"
 run_step_ok "$STEPS_DIR/tag.sh" "$TMP_ROOT/tag-conflict.log" \
-  "GITHUB_OUTPUT=$out" "GH_CALL_LOG=$GH_CALL_LOG" \
-  "REPO=acme/app" "SHA=$HEAD_SHA" "TAG_PREFIX=v" "MODE=publish"
+  "GITHUB_OUTPUT=$out" "SHA=$HEAD_SHA" "TAG_PREFIX=v"
 if [ "$("$REAL_GIT" -C "$WORK_DIR" rev-list -n 1 "$BASE_TAG")" != "$PARENT_SHA" ]; then
   fail "an existing tag must never be moved"
 fi
@@ -745,6 +832,28 @@ assert_file_contains "$ISSUE_LOG" "issue create"
 assert_file_not_contains "$ISSUE_LOG" "--label"
 assert_file_contains "$TMP_ROOT/notify-unlabelled.log" "Missing label"
 pass "a missing release-automation label still opens the alert, unlabelled"
+
+assert_file_contains "$WORK_DIR/issue_body.md" "resolved; not created by this run"
+: > "$ISSUE_LOG"
+run_step_ok "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-created.log" \
+  "GH_ISSUE_LOG=$ISSUE_LOG" "TAG_CREATED=true" \
+  "REPO=acme/app" "SHA=$TIP" "TAG=v2026.9.24" "MODE=publish" \
+  "RUN_URL=https://github.invalid/run/1"
+assert_file_not_contains "$WORK_DIR/issue_body.md" "not created by this run"
+pass "the alert says whether the tag it names was actually created"
+
+# The stub gh is still first on the caller's PATH here. With GH_BIN unset the
+# old fallback would have handed it the issues: write token.
+: > "$ISSUE_LOG"
+if run_step "$STEPS_DIR/notify.sh" "$TMP_ROOT/notify-no-gh.log" \
+  "GH_BIN=" "GH_ISSUE_LOG=$ISSUE_LOG" \
+  "REPO=acme/app" "SHA=" "TAG=" "MODE=publish" \
+  "RUN_URL=https://github.invalid/run/1"; then
+  fail "the alert must fail closed when the preflight never verified gh"
+fi
+[ -s "$ISSUE_LOG" ] && fail "an unverified gh from PATH must never be used to open the alert"
+assert_file_contains "$TMP_ROOT/notify-no-gh.log" "Alert not sent"
+pass "without a verified gh the alert fails closed instead of using gh from PATH"
 
 echo
 echo "All $pass_count checks passed."
