@@ -1,0 +1,74 @@
+# Shared release-drafter config for WebLime repositories.
+#
+# Repos inherit this by reference, not by copy:
+#
+#   _extends:
+#     from: WebLime-agency/.github:release-drafter-base.yml@main
+#     strategy:
+#       categories: append
+#
+# Deliberately at the repo ROOT, not at .github/release-drafter.yml — the
+# latter is the path release-drafter's legacy repo-only `_extends` form
+# resolves to, so a config there would be inherited implicitly by anything in
+# the org referencing this repo by name. An explicit path keeps inheritance
+# predictable and greppable.
+#
+# THIS REPOSITORY IS PUBLIC. Nothing repo-internal belongs in this file: no
+# tracker-ID patterns, no internal directory layouts, no repo-specific path
+# globs. Those live in each private repo's own .github/release-drafter.yml.
+# If consolidating duplication into here is ever proposed, that is the reason
+# to decline.
+
+tag-prefix: 'v'
+
+# Every release this workflow creates targets the production branch, so there
+# is nothing to filter previous releases by.
+filter-by-commitish: false
+include-pre-releases: false
+
+sort-by: merged_at
+sort-direction: ascending
+
+categories:
+  - title: '✨ New'
+    labels: ['release/new']
+  - title: '💪 Improved'
+    labels: ['release/improved']
+  - title: '🐛 Fixed'
+    labels: ['release/fixed']
+  - title: '🔌 Integrations & API'
+    labels: ['release/api']
+  - title: '🔒 Security & reliability'
+    labels: ['release/security']
+  - title: '🧱 Internal'
+    labels: ['release/internal']
+    collapse-after: 0
+
+exclude-labels:
+  - 'release/skip'
+
+change-template: '- $TITLE (#$NUMBER)'
+no-changes-template: '_No user-facing changes in this deploy._'
+
+# The header and the full-changelog link are injected by the workflow, which
+# is the only thing that knows the deployed SHA and the deploy run URLs.
+template: |
+  $CHANGES
+
+# Defaults applied only where a branch prefix has one honest meaning.
+# `feat/*` is deliberately absent: a feature branch may be new, improved or
+# API work, and guessing would file improvement work in the wrong marketing
+# category. The per-repo label guard makes the author choose.
+autolabeler:
+  - label: 'release/fixed'
+    branch:
+      - '/^(fix|bug|hotfix)\//'
+  - label: 'release/internal'
+    branch:
+      - '/^(chore|ci|refactor|deps|test)\//'
+  - label: 'release/skip'
+    branch:
+      - '/^docs\//'
+  - label: 'release/security'
+    title:
+      - '/^(🔒|security\b)/i'
