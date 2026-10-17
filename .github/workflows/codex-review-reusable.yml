@@ -33,7 +33,7 @@ jobs:
       (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'COLLABORATOR')
     # Private repos run on our own self-hosted runners (no GitHub minutes); public
     # repos stay on GitHub-hosted where gh is preinstalled and public minutes are free.
-    runs-on: ${{ github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","Linux"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     permissions:
       contents: read
