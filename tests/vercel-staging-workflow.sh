@@ -1381,6 +1381,13 @@ test_smoke_login_redirect_is_failure() {
     'http://vercel.com/login' \
     'https://vercel.com:443/login?sso=1' \
     'https://vercel.com./login?sso=1' \
+    'https://vercel.com。/login' \
+    'https://vercel.com．/login' \
+    'https://vercel.com｡/login' \
+    'https://vercel.com。:443/login' \
+    'https://vercel.com．:443/login' \
+    'https://vercel.com｡:443/login' \
+    'https://vercel.com%E3%80%82/login' \
     'https://VeRcEl.CoM.:443/login?sso=1' \
     'https://LOGIN.VERCEL.COM.:443/team/sso?next=app' \
     'https://VeRcEl.CoM:443/SSO?next=app' \

@@ -770,7 +770,7 @@ jobs:
               if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url) or re.search(r"%(?![0-9A-Fa-f]{2})", url):
                   raise ValueError("invalid URL characters")
               parsed = urlsplit(url)
-              host = unquote(parsed.hostname or "", errors="strict").rstrip(".").lower().encode("idna").decode("ascii")
+              host = unquote(parsed.hostname or "", errors="strict").lower().encode("idna").decode("ascii").rstrip(".")
               port = parsed.port
               if not host or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in host) or parsed.username is not None or any(c in host for c in "/\\?#@%") or (port is not None and not 1 <= port <= 65535):
                   raise ValueError("invalid authority")

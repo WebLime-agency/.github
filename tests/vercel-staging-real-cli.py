@@ -280,7 +280,14 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
     curl.write_text("#!/usr/bin/python3\nimport os,sys\nif '--config' in sys.argv: sys.stdin.read()\nprint('200 ' + os.environ['OFFLINE_LANDING'])\n")
     curl.chmod(0o755)
     smoke_env = {'CURL_BIN':str(curl), 'DEPLOYMENT_URL':'https://candidate.vercel.app', 'PROMOTED_ALIASES':'pythonlife.org,staging.lm.fm', 'VERCEL_AUTOMATION_BYPASS_SECRET':'syntheticBypass'}
-    for url in ('https://vercel.com/%6cogin', 'https://vercel.com/a/%2e%2e/%6cogin', 'http://vercel.com/login', 'https://vercel.com/team/%73so'):
+    for url in ('https://vercel.com/%6cogin', 'https://vercel.com/a/%2e%2e/%6cogin', 'http://vercel.com/login', 'https://vercel.com/team/%73so',
+                'https://vercel.com。/login',
+                'https://vercel.com．/login',
+                'https://vercel.com｡/login',
+                'https://vercel.com。:443/login',
+                'https://vercel.com．:443/login',
+                'https://vercel.com｡:443/login',
+                'https://vercel.com%E3%80%82/login'):
         result, output = step('smoke', neutral, smoke_env | {'OFFLINE_LANDING':url})
         require(result.returncode == 0 and output.get('result') == 'failed' and 'Staging smoke hit Vercel login' in result.stdout, 'decoded/HTTP login must produce login-specific rejection', result)
     for url in ('http://app.example/ok', 'https:///bad', 'https://app.example:bad/ok', 'https://app.example/%zz', 'https://app%20example/ok'):
