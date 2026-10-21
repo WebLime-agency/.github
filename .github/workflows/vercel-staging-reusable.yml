@@ -262,7 +262,9 @@ jobs:
           node-version-file: src-${{ github.run_id }}-${{ github.run_attempt }}/${{ inputs.node_version_file }}
 
       - name: Build Vercel staging output
+        id: build
         env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
           NODE_OPTIONS: --max-old-space-size=4096
           NODE_BIN: ${{ steps.tools.outputs.node }}
           VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
@@ -294,6 +296,12 @@ jobs:
             echo "::error title=Missing Vercel output::vercel build did not create .vercel/output/config.json."
             exit 1
           fi
+
+          # Hand off only the successful build of this verified checkout.
+          {
+            echo "source_dir=$PWD"
+            echo "source_sha=$EXPECTED_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare staging aliases
         id: prep
@@ -341,6 +349,8 @@ jobs:
         id: control
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
+          BUILD_SOURCE_DIR: ${{ steps.build.outputs.source_dir }}
+          BUILD_SOURCE_SHA: ${{ steps.build.outputs.source_sha }}
           ORIGIN_DEV_SHA: ${{ steps.prep.outputs.origin_dev_sha }}
           STAGING_ALIASES: ${{ steps.prep.outputs.aliases }}
           NEUTRAL_DIR: ${{ runner.temp }}
@@ -360,10 +370,11 @@ jobs:
           # token-bearing step.
           unset NODE_OPTIONS NODE_PATH
           export NODE_NO_WARNINGS=1
+          SOURCE_DIR=$PWD
 
           run_vercel() {
             (
-              cd "${NEUTRAL_DIR}"
+              cd "${NEUTRAL_DIR}" || exit 1
               NODE_OPTIONS='' NODE_PATH='' HOME="$NEUTRAL_DIR" "$NODE_BIN" -- "$VERCEL_BIN" "$@"
             )
           }
@@ -520,7 +531,18 @@ jobs:
             exit 0
           fi
 
-          deploy_output="$(run_vercel deploy --prebuilt --token="$VERCEL_TOKEN")"
+          # The interpreter starts in a neutral directory, but --prebuilt must
+          # consume the output from the exact checkout that passed build.
+          if [ "${BUILD_SOURCE_DIR:-}" != "$SOURCE_DIR" ] || [ "${BUILD_SOURCE_SHA:-}" != "$EXPECTED_SHA" ] || [ ! -f "$SOURCE_DIR/.vercel/output/config.json" ]; then
+            echo "::error title=Staging build binding failed::Missing output or build receipt does not match the exact-SHA checkout."
+            set_result "failed"
+            exit 0
+          fi
+          if ! deploy_output="$(run_vercel deploy --prebuilt --cwd "$SOURCE_DIR" --token="$VERCEL_TOKEN")"; then
+            echo "::error title=Staging prebuilt deploy failed::Unable to deploy the verified build output."
+            set_result "failed"
+            exit 0
+          fi
           if ! deployment_url="$(parse_deploy_url "$deploy_output")"; then
             echo "::error title=Unable to parse deployment URL::vercel deploy did not return an immutable deployment URL."
             set_result "failed"
@@ -581,13 +603,20 @@ jobs:
           # as a failed check rather than a successful smoke.
           is_vercel_login_url() {
             local url=${1,,}
+            local authority path
             case "$url" in
-              https://vercel.com/login*|https://vercel.com/sso*|https://vercel.com/*/sso*)
-                return 0
-                ;;
-              https://*.vercel.com/login*|https://*.vercel.com/sso*|https://*.vercel.com/*/sso*)
-                return 0
-                ;;
+              https://*) url=${url#https://} ;;
+              *) return 1 ;;
+            esac
+            authority=${url%%/*}
+            authority=${authority%:443}
+            path=/${url#*/}
+            case "$authority" in
+              vercel.com|*.vercel.com) ;;
+              *) return 1 ;;
+            esac
+            case "$path" in
+              /login*|/sso*|/*/sso*) return 0 ;;
             esac
             return 1
           }

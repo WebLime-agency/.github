@@ -191,6 +191,7 @@ STUB
 set -euo pipefail
 
 echo "node" >> "${NODE_LOG:?}"
+printf 'node-cwd=%s\n' "$PWD" >> "${NODE_LOG:?}"
 printf 'node-options=%s\n' "${NODE_OPTIONS:-}" >> "${NODE_LOG:?}"
 printf 'node-path=%s\n' "${NODE_PATH:-}" >> "${NODE_LOG:?}"
 if [ "${NODE_FORCE_FAIL:-0}" = "1" ]; then
@@ -331,16 +332,16 @@ if [ "$scenario" = "alias_login" ]; then
   if [ "$url" = "$candidate_url" ]; then
     printf '200 %s\n' "$url"
   else
-    printf '200 https://vercel.com/login?sso=1\n'
+    printf '200 %s\n' "${LOGIN_URL:-https://vercel.com/login?sso=1}"
   fi
   exit 0
 fi
-if [ "$scenario" = "candidate_login" ]; then
-  printf '200 https://vercel.com/login?sso=1\n'
+if [ "$scenario" = "candidate_login" ] && [ "$url" = "$candidate_url" ]; then
+  printf '200 %s\n' "${LOGIN_URL:-https://vercel.com/login?sso=1}"
   exit 0
 fi
-if [ "$scenario" = "candidate_login_3xx" ]; then
-  printf '307 https://vercel.com/login?sso=1\n'
+if [ "$scenario" = "candidate_login_3xx" ] && [ "$url" = "$candidate_url" ]; then
+  printf '307 %s\n' "${LOGIN_URL:-https://vercel.com/login?sso=1}"
   exit 0
 fi
 if [ "$scenario" = "candidate_redirect_3xx" ]; then
@@ -409,11 +410,23 @@ if (command === '--version') {
 
 switch (command) {
   case 'build':
+    if (process.env.VERCEL_TOKEN) throw new Error('build must be tokenless');
     fs.mkdirSync(path.join('.vercel', 'output'), { recursive: true });
-    fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), '{}\n');
+    fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), JSON.stringify({ fixture: 'fresh-' + process.env.EXPECTED_SHA }) + '\n');
     log('build');
     break;
-  case 'deploy':
+  case 'deploy': {
+    const cwdIndex = argv.indexOf('--cwd');
+    const deployDir = cwdIndex === -1 ? process.cwd() : argv[cwdIndex + 1];
+    const config = path.join(deployDir, '.vercel', 'output', 'config.json');
+    log('deploy-cwd ' + deployDir);
+    if (!fs.existsSync(config)) {
+      console.error('missing synthetic prebuilt output');
+      process.exit(46);
+    }
+    // Model CLI cwd/prebuilt resolution, without enforcing workflow binding:
+    // a stale output would really be deployed if the workflow selects it.
+    log('deployed-fixture ' + JSON.parse(fs.readFileSync(config, 'utf8')).fixture);
     log('deploy');
     if (mode === 'deploy_malformed') {
       process.stdout.write('no deployment url here\n');
@@ -421,6 +434,7 @@ switch (command) {
       process.stdout.write('https://candidate.vercel.app\n');
     }
     break;
+  }
   case 'inspect': {
     const target = argv[1];
     if (!target) {
@@ -587,6 +601,27 @@ assert_file_contains "$WORKFLOW_FILE" "dedicated"
     fail "the smoke step must not downgrade the missing bypass secret to a warning"
   fi
 
+  # Check the parsed scopes as well as the textual secret-reference counts.
+  /usr/bin/python3 - "$WORKFLOW_FILE" <<'PYTHON'
+import sys
+import yaml
+workflow = yaml.safe_load(open(sys.argv[1]))
+job = workflow['jobs']['deploy-staging']
+steps = job['steps']
+for scope in (workflow, job):
+    assert not any('VERCEL_TOKEN' in k or 'BYPASS_SECRET' in k for k in scope.get('env', {}))
+token_steps = [s for s in steps if 'VERCEL_TOKEN' in s.get('env', {})]
+bypass_steps = [s for s in steps if 'VERCEL_AUTOMATION_BYPASS_SECRET' in s.get('env', {})]
+assert len(token_steps) == 1 and token_steps[0]['id'] == 'control'
+assert len(bypass_steps) == 1 and bypass_steps[0]['id'] == 'smoke'
+build = next(s for s in steps if s.get('id') == 'build')
+control = token_steps[0]
+assert control['working-directory'] == build['working-directory']
+assert control['env']['BUILD_SOURCE_DIR'] == '${{ steps.build.outputs.source_dir }}'
+assert control['env']['BUILD_SOURCE_SHA'] == '${{ steps.build.outputs.source_sha }}'
+assert build['env']['EXPECTED_SHA'] == '${{ inputs.expected_sha }}'
+PYTHON
+
   pass "static workflow contract is artifact-free and secrets are step-scoped"
 }
 
@@ -707,6 +742,10 @@ set_control_env() {
   export ORIGIN_DEV_SHA=1111111111111111111111111111111111111111
   export STAGING_ALIASES=pythonlife.org,staging.lm.fm
   export NEUTRAL_DIR="$TMP_ROOT/neutral"
+  export CONTROL_WORKDIR="$TMP_ROOT/exact-checkout"
+  export BUILD_SOURCE_DIR="$CONTROL_WORKDIR"
+  export BUILD_SOURCE_SHA="$EXPECTED_SHA"
+  export GIT_BIN="$STUB_DIR/git"
   export JQ_BIN=/usr/bin/jq
   export PYTHON_BIN=/usr/bin/python3
   export VERCEL_BIN="$STUB_DIR/vercel-trusted"
@@ -721,7 +760,8 @@ set_control_env() {
   export GITHUB_RUN_ID=99
   export GITHUB_RUN_ATTEMPT=1
   rm -rf "$VERCEL_STATE_DIR"
-  mkdir -p "$NEUTRAL_DIR" "$VERCEL_STATE_DIR"
+  mkdir -p "$NEUTRAL_DIR" "$VERCEL_STATE_DIR" "$CONTROL_WORKDIR/.vercel/output"
+  printf '{"fixture":"fresh-%s"}\n' "$EXPECTED_SHA" > "$CONTROL_WORKDIR/.vercel/output/config.json"
   : > "$GITHUB_OUTPUT"
   : > "$VERCEL_LOG"
   : > "$NODE_LOG"
@@ -742,12 +782,62 @@ run_control_script() {
   return "$status"
 }
 
+test_build_output_is_bound_to_deploy() {
+  local out="$TMP_ROOT/build-deploy.out"
+  local build_output="$TMP_ROOT/build-deploy-output"
+
+  set_control_env
+  mkdir -p "$NEUTRAL_DIR/.vercel/output"
+  printf '{"fixture":"stale-neutral"}\n' > "$NEUTRAL_DIR/.vercel/output/config.json"
+  rm -rf "$CONTROL_WORKDIR/.vercel"
+  : > "$build_output"
+  (
+    cd "$CONTROL_WORKDIR"
+    unset VERCEL_TOKEN
+    run_script "$STEPS_DIR/verify-source.sh" "$out" || fail "exact source must verify before build"
+    GITHUB_OUTPUT="$build_output" run_script "$STEPS_DIR/build.sh" "$out" || fail "exact-SHA build must succeed"
+  )
+  export BUILD_SOURCE_DIR BUILD_SOURCE_SHA
+  BUILD_SOURCE_DIR=$(read_output "$build_output" source_dir)
+  BUILD_SOURCE_SHA=$(read_output "$build_output" source_sha)
+  run_control_script "$out" || fail "fresh build deploy should succeed"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = success ] || fail "fresh build was not deployed"
+  assert_file_contains "$VERCEL_LOG" "deployed-fixture fresh-$EXPECTED_SHA"
+  assert_file_contains "$VERCEL_LOG" "deploy-cwd $CONTROL_WORKDIR"
+  assert_file_not_contains "$VERCEL_LOG" "deployed-fixture stale-neutral"
+  assert_file_contains "$NODE_LOG" "node-cwd=$NEUTRAL_DIR"
+
+  # Keep the stale neutral output present for every negative case. None may
+  # fall back to it, deploy anything, or change an alias.
+  local scenario
+  for scenario in missing_output wrong_directory wrong_sha missing_receipt; do
+    set_control_env
+    case "$scenario" in
+      missing_output) rm -rf "$CONTROL_WORKDIR/.vercel/output" ;;
+      wrong_directory) export BUILD_SOURCE_DIR="$NEUTRAL_DIR" ;;
+      wrong_sha) export BUILD_SOURCE_SHA=2222222222222222222222222222222222222222 ;;
+      missing_receipt) export BUILD_SOURCE_DIR="" BUILD_SOURCE_SHA="" ;;
+    esac
+    run_control_script "$out" || fail "invalid build binding must be a managed failure"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "$scenario must fail closed"
+    assert_file_contains "$out" "Staging build binding failed"
+    assert_file_not_contains "$VERCEL_LOG" "deployed-fixture"
+    assert_file_not_contains "$VERCEL_LOG" "alias set"
+  done
+  set_control_env
+  run_control_script "$out" NEUTRAL_DIR="$TMP_ROOT/absent-neutral" || fail "startup directory failure must be managed"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "missing neutral directory must fail closed"
+  assert_file_contains "$out" "Staging prebuilt deploy failed"
+  assert_file_not_contains "$VERCEL_LOG" "deployed-fixture"
+  pass "deploy consumes the exact-SHA build and rejects missing or mismatched output bindings"
+}
+
 test_control_plane_success_and_superseded() {
   local out="$TMP_ROOT/control.out"
 
   set_control_env
   touch "$NEUTRAL_DIR/re.py" "$NEUTRAL_DIR/sitecustomize.py" "$NEUTRAL_DIR/usercustomize.py"
-  run_script "$STEPS_DIR/control-plane.sh" "$out" PYTHONPATH="$NEUTRAL_DIR" PYTHONSTARTUP="$NEUTRAL_DIR/re.py" HOME="$NEUTRAL_DIR" || fail "control success should pass"
+  run_control_script "$out" PYTHONPATH="$NEUTRAL_DIR" PYTHONSTARTUP="$NEUTRAL_DIR/re.py" HOME="$NEUTRAL_DIR" || fail "control success should pass"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "success" ]; then
     fail "successful control step did not emit success"
   fi
@@ -756,7 +846,7 @@ test_control_plane_success_and_superseded() {
   assert_file_not_contains "$out" "synthetic-secret-token"
 
   set_control_env
-  run_script "$STEPS_DIR/control-plane.sh" "$out" ORIGIN_DEV_SHA=2222222222222222222222222222222222222222 || fail "superseded should be a managed result"
+  run_control_script "$out" ORIGIN_DEV_SHA=2222222222222222222222222222222222222222 || fail "superseded should be a managed result"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "superseded" ]; then
     fail "superseded guard did not emit superseded"
   fi
@@ -780,7 +870,7 @@ test_build_step_starts_cli_through_preflighted_node() {
   export PATH_NODE_MARKER="$TMP_ROOT/path-node-marker"
   export PATH_VERCEL_MARKER="$TMP_ROOT/path-vercel-marker"
   export RUNNER_TEMP="$TMP_ROOT/build-runner-temp"
-  unset VERCEL_STUB_VERSION
+  unset VERCEL_STUB_VERSION VERCEL_TOKEN
   rm -rf "$workdir"
   mkdir -p "$workdir" "$RUNNER_TEMP"
   : > "$NODE_LOG"
@@ -823,14 +913,14 @@ test_control_plane_failure_modes() {
   local out="$TMP_ROOT/control-fail.out"
 
   set_control_env
-  run_script "$STEPS_DIR/control-plane.sh" "$out" VERCEL_MODE=malformed_inspect || fail "malformed inspect is managed"
+  run_control_script "$out" VERCEL_MODE=malformed_inspect || fail "malformed inspect is managed"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
     fail "malformed inspect should emit failed"
   fi
   assert_file_not_contains "$VERCEL_LOG" "alias set https://candidate.vercel.app"
 
   set_control_env
-  run_script "$STEPS_DIR/control-plane.sh" "$out" FAIL_SECOND_ALIAS=1 || fail "second alias failure should be managed"
+  run_control_script "$out" FAIL_SECOND_ALIAS=1 || fail "second alias failure should be managed"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "rolled_back" ]; then
     fail "second alias failure should emit rolled_back"
   fi
@@ -839,7 +929,7 @@ test_control_plane_failure_modes() {
   assert_file_not_contains "$out" "synthetic-secret-token"
 
   set_control_env
-  run_script "$STEPS_DIR/control-plane.sh" "$out" FAIL_SECOND_ALIAS=1 ROLLBACK_FAIL=1 || fail "rollback failure should be managed"
+  run_control_script "$out" FAIL_SECOND_ALIAS=1 ROLLBACK_FAIL=1 || fail "rollback failure should be managed"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "rollback_failed" ]; then
     fail "rollback failure should emit rollback_failed"
   fi
@@ -1080,37 +1170,40 @@ test_smoke_without_bypass_fails_closed() {
 
 test_smoke_login_redirect_is_failure() {
   local out="$TMP_ROOT/smoke-login.out"
+  local scenario login_url
+  for login_url in \
+    'https://vercel.com/login?sso=1' \
+    'https://vercel.com:443/login?sso=1' \
+    'https://VeRcEl.CoM:443/SSO?next=app' \
+    'https://LOGIN.VERCEL.COM:443/team/sso?next=app'; do
+    for scenario in candidate_login candidate_login_3xx alias_login; do
+      set_smoke_env
+      run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO="$scenario" LOGIN_URL="$login_url" \
+        VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+        EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "login rejection must be a managed failure"
+      [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "$scenario at $login_url must fail"
+      if [ "$scenario" = alias_login ]; then
+        assert_file_contains "$out" "::error title=Staging smoke hit Vercel login::alias pythonlife.org"
+      else
+        assert_file_contains "$out" "::error title=Staging smoke hit Vercel login::candidate"
+      fi
+      assert_file_contains "$out" "manual-recovery incident"
+      assert_file_not_contains "$out" "Staging smoke request failed"
+      assert_file_not_contains "$out" "synthetic-bypass-value"
+      assert_file_contains "$CURL_LOG" 'url=https://candidate.vercel.app bypass_header=yes bypass_value=correct'
+      assert_file_contains "$CURL_LOG" 'url=https://pythonlife.org bypass_header=no'
+      assert_file_contains "$CURL_LOG" 'url=https://staging.lm.fm bypass_header=no'
+      assert_file_not_contains "$CURL_ARGV_LOG" "synthetic-bypass-value"
+    done
+  done
 
   set_smoke_env
-  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_login \
-    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "login redirect is a managed smoke failure"
-  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
-    fail "candidate login redirect must fail the smoke"
-  fi
-  assert_file_contains "$out" "manual-recovery incident"
-
-  set_smoke_env
-  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_login_3xx \
-    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "3xx login redirect is a managed smoke failure"
-  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
-    fail "candidate 3xx login redirect must fail the smoke"
-  fi
-
-  set_smoke_env
-  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login \
-    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "alias login redirect is a managed smoke failure"
-  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
-    fail "alias login redirect must fail the smoke, even with a bypass secret"
-  fi
-  assert_file_contains "$out" "manual-recovery incident"
-
-  set_smoke_env
-  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login || fail "alias login redirect is a managed smoke failure"
-  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
-    fail "alias login redirect must fail the smoke without a bypass secret"
-  fi
-
-  pass "Vercel login/SSO redirects fail the smoke instead of passing"
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login || fail "alias login must fail without a bypass"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "missing bypass plus alias login must fail"
+  assert_file_contains "$out" "::error title=Staging smoke hit Vercel login::alias pythonlife.org"
+  assert_file_contains "$out" "VERCEL_AUTOMATION_BYPASS_SECRET not configured"
+  assert_file_contains "$CURL_LOG" 'url=https://pythonlife.org bypass_header=no'
+  pass "Vercel login/SSO rejection normalizes host case and the default HTTPS port"
 }
 
 test_smoke_rejects_unsafe_bypass_value() {
@@ -1176,6 +1269,7 @@ test_static_contract
 test_preflight_vercel_cli
 test_verify_exact_source
 test_prepare_alias_allowlist
+test_build_output_is_bound_to_deploy
 test_control_plane_success_and_superseded
 test_control_plane_failure_modes
 test_build_step_starts_cli_through_preflighted_node
