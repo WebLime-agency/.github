@@ -124,6 +124,8 @@ extract_steps() {
   extract_step "Verify exact source" "$STEPS_DIR/verify-source.sh"
   extract_step "Build Vercel staging output" "$STEPS_DIR/build.sh"
   extract_step "Prepare staging aliases" "$STEPS_DIR/prepare-aliases.sh"
+  extract_step "Prepare staging deploy context" "$STEPS_DIR/deploy-context.sh"
+  extract_step "Clean staging deploy context" "$STEPS_DIR/cleanup-context.sh"
   extract_step "Vercel control-plane deploy/promote" "$STEPS_DIR/control-plane.sh"
   extract_step "Smoke staging candidate and aliases" "$STEPS_DIR/smoke.sh"
   extract_step "Finalize staging result" "$STEPS_DIR/finalize.sh"
@@ -411,13 +413,24 @@ if (command === '--version') {
 switch (command) {
   case 'build':
     if (process.env.VERCEL_TOKEN) throw new Error('build must be tokenless');
+    // vercel@56.3.1 dist/commands/build/index.js readProjectSettings contract.
+    if (!fs.existsSync('.vercel/project.json') || !JSON.parse(fs.readFileSync('.vercel/project.json', 'utf8')).settings) {
+      console.error('No Project Settings found locally');
+      process.exit(1);
+    }
+    log('build-settings ' + JSON.stringify(JSON.parse(fs.readFileSync('.vercel/project.json', 'utf8'))));
     fs.mkdirSync(path.join('.vercel', 'output'), { recursive: true });
-    fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), JSON.stringify({ fixture: 'fresh-' + process.env.EXPECTED_SHA }) + '\n');
+    fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), JSON.stringify({ version: 3, fixture: 'fresh-' + process.env.EXPECTED_SHA }) + '\n');
     log('build');
     break;
   case 'deploy': {
     const cwdIndex = argv.indexOf('--cwd');
     const deployDir = cwdIndex === -1 ? process.cwd() : argv[cwdIndex + 1];
+    // Pinned deploy compiles programmatic config BEFORE the prebuilt branch.
+    for (const ext of ['ts', 'mts', 'js', 'mjs', 'cjs']) {
+      const file = path.join(deployDir, 'vercel.' + ext);
+      if (fs.existsSync(file)) new Function('require', fs.readFileSync(file, 'utf8'))(require);
+    }
     const config = path.join(deployDir, '.vercel', 'output', 'config.json');
     log('deploy-cwd ' + deployDir);
     if (!fs.existsSync(config)) {
@@ -616,9 +629,14 @@ assert len(token_steps) == 1 and token_steps[0]['id'] == 'control'
 assert len(bypass_steps) == 1 and bypass_steps[0]['id'] == 'smoke'
 build = next(s for s in steps if s.get('id') == 'build')
 control = token_steps[0]
-assert control['working-directory'] == build['working-directory']
-assert control['env']['BUILD_SOURCE_DIR'] == '${{ steps.build.outputs.source_dir }}'
-assert control['env']['BUILD_SOURCE_SHA'] == '${{ steps.build.outputs.source_sha }}'
+context = next(s for s in steps if s.get('id') == 'deploy_context')
+assert context['working-directory'] == build['working-directory']
+assert control['working-directory'] == '${{ runner.temp }}'
+assert context['env']['BUILD_SOURCE_DIR'] == '${{ steps.build.outputs.source_dir }}'
+assert context['env']['BUILD_SOURCE_SHA'] == '${{ steps.build.outputs.source_sha }}'
+assert control['env']['DEPLOY_DIR'] == '${{ steps.deploy_context.outputs.deploy_dir }}'
+assert control['env']['DEPLOY_SOURCE_SHA'] == '${{ steps.deploy_context.outputs.source_sha }}'
+assert build['env']['PROJECT_SETTINGS_JSON'] == '${{ inputs.project_settings }}'
 assert build['env']['EXPECTED_SHA'] == '${{ inputs.expected_sha }}'
 PYTHON
 
@@ -748,6 +766,7 @@ set_control_env() {
   export GIT_BIN="$STUB_DIR/git"
   export JQ_BIN=/usr/bin/jq
   export PYTHON_BIN=/usr/bin/python3
+  export PROJECT_SETTINGS_JSON='{"framework":null,"installCommand":"","outputDirectory":"public"}'
   export VERCEL_BIN="$STUB_DIR/vercel-trusted"
   export NODE_BIN="$STUB_DIR/node-trusted"
   export VERCEL_ORG_ID=org
@@ -768,18 +787,85 @@ set_control_env() {
   : > "$PATH_NODE_MARKER"
 }
 
-run_control_script() {
+prepare_context() {
+  local out_file=$1
+  local context_output="$TMP_ROOT/context-output"
+  : > "$context_output"
+  (
+    cd "$CONTROL_WORKDIR"
+    unset VERCEL_TOKEN
+    GITHUB_OUTPUT="$context_output" run_script "$STEPS_DIR/deploy-context.sh" "$out_file"
+  ) || return 1
+  export DEPLOY_DIR DEPLOY_SOURCE_SHA
+  DEPLOY_DIR=$(read_output "$context_output" deploy_dir)
+  DEPLOY_SOURCE_SHA=$(read_output "$context_output" source_sha)
+}
+
+run_prepared_control_script() {
   local out_file=$1
   shift
-
   set +e
   (
-    cd "${CONTROL_WORKDIR:-$ROOT_DIR}"
+    cd "$NEUTRAL_DIR"
     env "$@" bash --noprofile --norc -e -o pipefail "$STEPS_DIR/control-plane.sh"
   ) >"$out_file" 2>&1
   local status=$?
   set -e
   return "$status"
+}
+
+run_control_script() {
+  local out_file=$1
+  shift
+  prepare_context "$out_file" || return 1
+  run_prepared_control_script "$out_file" "$@"
+}
+
+test_control_never_runs_source_config() {
+  local out="$TMP_ROOT/source-config.out"
+  local ext
+  export CONFIG_MARKER="$TMP_ROOT/config-marker"
+  for ext in ts mts js mjs cjs; do
+    set_control_env
+    rm -f "$CONTROL_WORKDIR"/vercel.* "$CONFIG_MARKER"
+    cat > "$CONTROL_WORKDIR/vercel.$ext" <<'CONFIG'
+if (process.env.VERCEL_TOKEN) {
+  require('fs').writeFileSync(process.env.CONFIG_MARKER, 'token-readable');
+  throw new Error('source config ran with token');
+}
+CONFIG
+    run_control_script "$out" || fail "control should succeed without evaluating source config"
+    [ ! -f "$CONFIG_MARKER" ] || fail "vercel.$ext executed with the token"
+    /usr/bin/python3 - "$DEPLOY_DIR" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+assert {p.name for p in root.iterdir()} == {'.vercel'}
+assert {p.name for p in (root / '.vercel').iterdir()} == {'output', 'project.json'}
+assert json.loads((root / '.vercel/project.json').read_text()) == {'orgId': 'org', 'projectId': 'project'}
+PYTHON
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = success ] || fail "source config must be excluded from deploy context"
+  done
+  pass "token-bearing deploy never evaluates repository-authored vercel config"
+}
+
+test_context_refuses_extra_files_and_cleans_up() {
+  local out="$TMP_ROOT/context-check.out"
+  set_control_env
+  prepare_context "$out" || fail "context preparation should succeed"
+  run_prepared_control_script "$out" DEPLOY_SOURCE_SHA=2222222222222222222222222222222222222222 || fail "wrong context SHA must be managed"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "wrong context SHA must fail closed"
+  assert_file_not_contains "$VERCEL_LOG" "deploy"
+  : > "$GITHUB_OUTPUT"
+  printf 'throw new Error("must not execute")' > "$DEPLOY_DIR/vercel.cjs"
+  run_prepared_control_script "$out" || fail "invalid context must be a managed failure"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "extra source config must fail closed"
+  assert_file_contains "$out" "Staging deploy context refused"
+  assert_file_not_contains "$VERCEL_LOG" "deploy"
+  run_script "$STEPS_DIR/cleanup-context.sh" "$out" || fail "cleanup must succeed"
+  [ ! -e "$DEPLOY_DIR" ] || fail "prepared context must be removed"
+  pass "context validation rejects extra files and cleanup removes only the prepared directory"
 }
 
 test_build_output_is_bound_to_deploy() {
@@ -803,7 +889,8 @@ test_build_output_is_bound_to_deploy() {
   run_control_script "$out" || fail "fresh build deploy should succeed"
   [ "$(read_output "$GITHUB_OUTPUT" result)" = success ] || fail "fresh build was not deployed"
   assert_file_contains "$VERCEL_LOG" "deployed-fixture fresh-$EXPECTED_SHA"
-  assert_file_contains "$VERCEL_LOG" "deploy-cwd $CONTROL_WORKDIR"
+  assert_file_contains "$VERCEL_LOG" "deploy-cwd $DEPLOY_DIR"
+  [ "$DEPLOY_DIR" != "$CONTROL_WORKDIR" ] || fail "deploy must not use checkout"
   assert_file_not_contains "$VERCEL_LOG" "deployed-fixture stale-neutral"
   assert_file_contains "$NODE_LOG" "node-cwd=$NEUTRAL_DIR"
 
@@ -818,8 +905,7 @@ test_build_output_is_bound_to_deploy() {
       wrong_sha) export BUILD_SOURCE_SHA=2222222222222222222222222222222222222222 ;;
       missing_receipt) export BUILD_SOURCE_DIR="" BUILD_SOURCE_SHA="" ;;
     esac
-    run_control_script "$out" || fail "invalid build binding must be a managed failure"
-    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "$scenario must fail closed"
+    prepare_context "$out" && fail "$scenario must fail preparation closed"
     assert_file_contains "$out" "Staging build binding failed"
     assert_file_not_contains "$VERCEL_LOG" "deployed-fixture"
     assert_file_not_contains "$VERCEL_LOG" "alias set"
@@ -827,7 +913,7 @@ test_build_output_is_bound_to_deploy() {
   set_control_env
   run_control_script "$out" NEUTRAL_DIR="$TMP_ROOT/absent-neutral" || fail "startup directory failure must be managed"
   [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "missing neutral directory must fail closed"
-  assert_file_contains "$out" "Staging prebuilt deploy failed"
+  assert_file_contains "$out" "Staging deploy context refused"
   assert_file_not_contains "$VERCEL_LOG" "deployed-fixture"
   pass "deploy consumes the exact-SHA build and rejects missing or mismatched output bindings"
 }
@@ -855,9 +941,32 @@ test_control_plane_success_and_superseded() {
   pass "control plane promotes deterministically and rejects stale SHA before aliases"
 }
 
+test_project_settings_rejects_invalid_inputs() {
+  local out="$TMP_ROOT/settings.out"
+  local workdir="$TMP_ROOT/settings-fresh"
+  local settings
+  set_control_env
+  for settings in '' '{}' 'not-json' '{"env":{"SECRET":"synthetic"}}' '{"env":"synthetic"}' '{"framework":true}'; do
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
+    (
+      cd "$workdir"
+      unset VERCEL_TOKEN
+      run_script "$STEPS_DIR/build.sh" "$out" PROJECT_SETTINGS_JSON="$settings"
+    ) && fail "invalid settings must fail before build"
+    assert_file_contains "$out" "Invalid Vercel project settings"
+    assert_file_not_contains "$VERCEL_LOG" "build"
+    [ ! -f "$workdir/.vercel/project.json" ] || fail "invalid settings must not write a project link"
+  done
+  pass "only explicit reviewed non-secret settings keys and types reach the fresh build"
+}
+
 test_build_step_starts_cli_through_preflighted_node() {
   local out="$TMP_ROOT/build.out"
   local workdir="$TMP_ROOT/build-workdir"
+  export PYTHON_BIN=/usr/bin/python3
+  export NEUTRAL_DIR="$TMP_ROOT/neutral"
+  export PROJECT_SETTINGS_JSON='{"framework":null,"installCommand":"","outputDirectory":"public"}'
 
   export PATH="$STUB_DIR:$PATH"
   export GITHUB_OUTPUT="$TMP_ROOT/build-output"
@@ -872,7 +981,8 @@ test_build_step_starts_cli_through_preflighted_node() {
   export RUNNER_TEMP="$TMP_ROOT/build-runner-temp"
   unset VERCEL_STUB_VERSION VERCEL_TOKEN
   rm -rf "$workdir"
-  mkdir -p "$workdir" "$RUNNER_TEMP"
+  mkdir -p "$workdir" "$RUNNER_TEMP" "$NEUTRAL_DIR"
+  [ ! -e "$workdir/.vercel" ] || fail "build fixture must start genuinely fresh"
   : > "$NODE_LOG"
   : > "$VERCEL_LOG"
   : > "$PATH_NODE_MARKER"
@@ -1174,6 +1284,9 @@ test_smoke_login_redirect_is_failure() {
   for login_url in \
     'https://vercel.com/login?sso=1' \
     'https://vercel.com:443/login?sso=1' \
+    'https://vercel.com./login?sso=1' \
+    'https://VeRcEl.CoM.:443/login?sso=1' \
+    'https://LOGIN.VERCEL.COM.:443/team/sso?next=app' \
     'https://VeRcEl.CoM:443/SSO?next=app' \
     'https://LOGIN.VERCEL.COM:443/team/sso?next=app'; do
     for scenario in candidate_login candidate_login_3xx alias_login; do
@@ -1203,7 +1316,7 @@ test_smoke_login_redirect_is_failure() {
   assert_file_contains "$out" "::error title=Staging smoke hit Vercel login::alias pythonlife.org"
   assert_file_contains "$out" "VERCEL_AUTOMATION_BYPASS_SECRET not configured"
   assert_file_contains "$CURL_LOG" 'url=https://pythonlife.org bypass_header=no'
-  pass "Vercel login/SSO rejection normalizes host case and the default HTTPS port"
+  pass "Vercel login/SSO rejection normalizes host case, default HTTPS port, and DNS root dot"
 }
 
 test_smoke_rejects_unsafe_bypass_value() {
@@ -1269,9 +1382,12 @@ test_static_contract
 test_preflight_vercel_cli
 test_verify_exact_source
 test_prepare_alias_allowlist
+test_control_never_runs_source_config
+test_context_refuses_extra_files_and_cleans_up
 test_build_output_is_bound_to_deploy
 test_control_plane_success_and_superseded
 test_control_plane_failure_modes
+test_project_settings_rejects_invalid_inputs
 test_build_step_starts_cli_through_preflighted_node
 test_post_promotion_smoke_incident
 test_smoke_bypass_header_candidate_only

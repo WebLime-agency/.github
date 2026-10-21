@@ -12,6 +12,15 @@ name: Vercel Staging Deploy (reusable)
 # - Provision the exact Node.js release named by the consumer's
 #   node_version_file at /usr/bin/node, root-owned and not
 #   group/world-writable. This reusable never resolves node through PATH.
+# - Callers must pass project_settings as reviewed NON-SECRET JSON. Allowed
+#   keys: framework, buildCommand, installCommand, devCommand, outputDirectory,
+#   rootDirectory, nodeVersion (string or null). Example for a static site:
+#   '{"framework":null,"installCommand":"","buildCommand":null,"outputDirectory":"public"}'
+#   Match the staging project's settings. Never include environment variables,
+#   credentials, or secret values. The tokenless build writes these settings and
+#   the non-secret org/project IDs to fresh .vercel/project.json; no pull occurs.
+#   Only .vercel/output and a regenerated ID-only link enter a fresh deploy
+#   directory. Repository sources and vercel.* configuration never enter it.
 # - Keep the consumer repo's staging environment secret VERCEL_TOKEN dedicated
 #   to staging, team-scoped for WebLime Vercel, and distinct from production.
 # - Own rotation/revocation and the manual recovery runbook for post-promotion
@@ -34,6 +43,10 @@ on:
     inputs:
       expected_sha:
         description: "Exact reviewed dev SHA to deploy to staging."
+        required: true
+        type: string
+      project_settings:
+        description: "Reviewed non-secret project settings JSON; allowed string/null keys: framework, buildCommand, installCommand, devCommand, outputDirectory, rootDirectory, nodeVersion. Never include env or credentials."
         required: true
         type: string
       node_version_file:
@@ -265,6 +278,9 @@ jobs:
         id: build
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
+          PROJECT_SETTINGS_JSON: ${{ inputs.project_settings }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          NEUTRAL_DIR: ${{ runner.temp }}
           NODE_OPTIONS: --max-old-space-size=4096
           NODE_BIN: ${{ steps.tools.outputs.node }}
           VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
@@ -290,6 +306,34 @@ jobs:
             exit 1
           fi
 
+          # Supply only reviewed non-secret settings; IDs alone do not make a
+          # fresh checkout buildable by the pinned CLI. Never pull with a token.
+          SOURCE_DIR=$PWD
+          (
+            cd "$NEUTRAL_DIR"
+            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          allowed = {"framework", "buildCommand", "installCommand", "devCommand", "outputDirectory", "rootDirectory", "nodeVersion"}
+          try:
+              settings = json.loads(os.environ["PROJECT_SETTINGS_JSON"])
+              if not isinstance(settings, dict) or not settings or set(settings) - allowed:
+                  raise ValueError("unreviewed keys")
+              if any(value is not None and not isinstance(value, str) for value in settings.values()):
+                  raise ValueError("invalid setting type")
+          except (KeyError, ValueError):
+              raise SystemExit("::error title=Invalid Vercel project settings::Supply reviewed non-secret settings JSON with only the documented keys and string/null values.")
+          source = Path(sys.argv[1])
+          vercel = source / ".vercel"
+          vercel.mkdir(exist_ok=True)
+          if vercel.is_symlink() or (vercel / "project.json").is_symlink():
+              raise SystemExit("::error::Refusing symlinked Vercel project settings.")
+          project = {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"], "settings": settings}
+          (vercel / "project.json").write_text(json.dumps(project))
+          PYTHON
+          )
           "$NODE_BIN" -- "$VERCEL_BIN" build
 
           if [ ! -d .vercel/output ] || [ ! -f .vercel/output/config.json ]; then
@@ -345,12 +389,55 @@ jobs:
             echo "aliases=$ALIASES"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Vercel control-plane deploy/promote
-        id: control
+      - name: Prepare staging deploy context
+        id: deploy_context
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           BUILD_SOURCE_DIR: ${{ steps.build.outputs.source_dir }}
           BUILD_SOURCE_SHA: ${{ steps.build.outputs.source_sha }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR=$PWD
+          if [ "${BUILD_SOURCE_DIR:-}" != "$SOURCE_DIR" ] || [ "${BUILD_SOURCE_SHA:-}" != "$EXPECTED_SHA" ] || [ ! -f "$SOURCE_DIR/.vercel/output/config.json" ]; then
+            echo "::error title=Staging build binding failed::Missing output or build receipt does not match the exact-SHA checkout."
+            exit 1
+          fi
+          (
+            cd "$NEUTRAL_DIR"
+            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          import tempfile
+          # Copy only build output. Dereference symlinks so the deploy context
+          # cannot refer back to repository sources/configuration.
+          deploy = Path(tempfile.mkdtemp(prefix="vercel-staging-deploy-", dir=os.getcwd()))
+          try:
+              shutil.copytree(Path(sys.argv[1]) / ".vercel/output", deploy / ".vercel/output")
+              link = {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"]}
+              (deploy / ".vercel/project.json").write_text(json.dumps(link))
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"deploy_dir={deploy}\nsource_sha={os.environ['EXPECTED_SHA']}\n")
+          except BaseException:
+              shutil.rmtree(deploy)
+              raise
+          PYTHON
+          )
+
+      - name: Vercel control-plane deploy/promote
+        id: control
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DEPLOY_DIR: ${{ steps.deploy_context.outputs.deploy_dir }}
+          DEPLOY_SOURCE_SHA: ${{ steps.deploy_context.outputs.source_sha }}
           ORIGIN_DEV_SHA: ${{ steps.prep.outputs.origin_dev_sha }}
           STAGING_ALIASES: ${{ steps.prep.outputs.aliases }}
           NEUTRAL_DIR: ${{ runner.temp }}
@@ -361,7 +448,7 @@ jobs:
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
+        working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
 
@@ -370,12 +457,11 @@ jobs:
           # token-bearing step.
           unset NODE_OPTIONS NODE_PATH
           export NODE_NO_WARNINGS=1
-          SOURCE_DIR=$PWD
 
           run_vercel() {
             (
               cd "${NEUTRAL_DIR}" || exit 1
-              NODE_OPTIONS='' NODE_PATH='' HOME="$NEUTRAL_DIR" "$NODE_BIN" -- "$VERCEL_BIN" "$@"
+              NODE_OPTIONS='' NODE_PATH='' HOME="$NEUTRAL_DIR" "$NODE_BIN" -- "$VERCEL_BIN" "$@" --cwd "$DEPLOY_DIR"
             )
           }
 
@@ -402,7 +488,7 @@ jobs:
 
           run_python() {
             (
-              cd "$NEUTRAL_DIR"
+              cd "$NEUTRAL_DIR" || exit 1
               PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$@"
             )
           }
@@ -531,14 +617,30 @@ jobs:
             exit 0
           fi
 
-          # The interpreter starts in a neutral directory, but --prebuilt must
-          # consume the output from the exact checkout that passed build.
-          if [ "${BUILD_SOURCE_DIR:-}" != "$SOURCE_DIR" ] || [ "${BUILD_SOURCE_SHA:-}" != "$EXPECTED_SHA" ] || [ ! -f "$SOURCE_DIR/.vercel/output/config.json" ]; then
-            echo "::error title=Staging build binding failed::Missing output or build receipt does not match the exact-SHA checkout."
+          # All CLI calls use the prepared minimal context, never the source
+          # checkout: even --prebuilt evaluates vercel.* from its deploy cwd.
+          if [ "${DEPLOY_SOURCE_SHA:-}" != "$EXPECTED_SHA" ] || ! run_python "${DEPLOY_DIR:-}" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          deploy = Path(sys.argv[1])
+          if not deploy.is_absolute() or deploy.is_symlink() or deploy.parent.resolve() != Path.cwd().resolve() or not deploy.name.startswith("vercel-staging-deploy-"):
+              raise SystemExit("invalid deploy directory")
+          if {p.name for p in deploy.iterdir()} != {".vercel"} or {p.name for p in (deploy / ".vercel").iterdir()} != {"output", "project.json"}:
+              raise SystemExit("unexpected deploy context files")
+          if any(p.is_symlink() for p in deploy.rglob("*")) or not (deploy / ".vercel/output/config.json").is_file():
+              raise SystemExit("invalid prebuilt output")
+          link = json.loads((deploy / ".vercel/project.json").read_text())
+          if link != {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"]}:
+              raise SystemExit("invalid project link")
+          PYTHON
+          then
+            echo "::error title=Staging deploy context refused::Missing or mismatched minimal build context."
             set_result "failed"
             exit 0
           fi
-          if ! deploy_output="$(run_vercel deploy --prebuilt --cwd "$SOURCE_DIR" --token="$VERCEL_TOKEN")"; then
+          if ! deploy_output="$(run_vercel deploy --prebuilt --token="$VERCEL_TOKEN")"; then
             echo "::error title=Staging prebuilt deploy failed::Unable to deploy the verified build output."
             set_result "failed"
             exit 0
@@ -610,6 +712,7 @@ jobs:
             esac
             authority=${url%%/*}
             authority=${authority%:443}
+            authority=${authority%.}
             path=/${url#*/}
             case "$authority" in
               vercel.com|*.vercel.com) ;;
@@ -784,3 +887,25 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Clean staging deploy context
+        if: always() && steps.deploy_context.outputs.deploy_dir != ''
+        env:
+          DEPLOY_DIR: ${{ steps.deploy_context.outputs.deploy_dir }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$NEUTRAL_DIR"
+            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import shutil
+          deploy = Path(os.environ["DEPLOY_DIR"])
+          if deploy.is_symlink() or deploy.parent.resolve() != Path.cwd().resolve() or not deploy.name.startswith("vercel-staging-deploy-"):
+              raise SystemExit("::error::Refusing cleanup of an unexpected deploy path.")
+          if deploy.exists():
+              shutil.rmtree(deploy)
+          PYTHON
+          )
