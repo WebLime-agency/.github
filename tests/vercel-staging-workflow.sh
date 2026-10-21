@@ -81,6 +81,42 @@ extract_step() {
   fi
 }
 
+extract_step_block() {
+  local step_name=$1
+  local output_file=$2
+
+  awk -v step="$step_name" '
+    /^      - name: / {
+      if (in_step) {
+        exit
+      }
+      in_step = ($0 == "      - name: " step)
+    }
+    in_step {
+      print
+    }
+  ' "$WORKFLOW_FILE" > "$output_file"
+
+  if [ ! -s "$output_file" ]; then
+    fail "could not extract workflow step block: $step_name"
+  fi
+}
+
+extract_workflow_call_secrets() {
+  awk '
+    /^    secrets:/ {
+      in_secrets = 1
+      next
+    }
+    in_secrets && /^[^ ]/ {
+      exit
+    }
+    in_secrets {
+      print
+    }
+  ' "$WORKFLOW_FILE"
+}
+
 extract_steps() {
   mkdir -p "$STEPS_DIR"
   extract_step "Preflight trusted tools" "$STEPS_DIR/preflight.sh"
@@ -182,11 +218,73 @@ STUB
   cat > "$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "$*" >> "${CURL_LOG:?}"
-if [ "${CURL_FAIL:-0}" = "1" ]; then
+
+args=("$@")
+url=${!#}
+write_out=""
+config_requested=0
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[$i]}" = "--write-out" ]; then
+    write_out=${args[$((i + 1))]:-}
+  fi
+  if [ "${args[$i]}" = "--config" ] && [ "${args[$((i + 1))]:-}" = "-" ]; then
+    config_requested=1
+  fi
+done
+
+config=""
+if [ "$config_requested" = "1" ]; then
+  config="$(cat)"
+fi
+
+bypass_header=no
+bypass_value=absent
+if printf '%s\n' "$config" | grep -Fq 'x-vercel-protection-bypass:'; then
+  bypass_header=yes
+  header_line=$(printf '%s\n' "$config" | grep -F 'x-vercel-protection-bypass:' | head -n 1)
+  if [ "$header_line" = "header = \"x-vercel-protection-bypass: ${EXPECTED_BYPASS_SECRET:?}\"" ]; then
+    bypass_value=correct
+  else
+    bypass_value=incorrect
+  fi
+fi
+
+env_has_secret=no
+if [ -n "${VERCEL_AUTOMATION_BYPASS_SECRET:-}" ]; then
+  env_has_secret=yes
+fi
+
+printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s\n' \
+  "$url" "$bypass_header" "$bypass_value" "$env_has_secret" >> "${CURL_LOG:?}"
+for arg in "${args[@]}"; do
+  printf '%s\n' "$arg" >> "${CURL_ARGV_LOG:?}"
+done
+
+scenario=${CURL_SCENARIO:-success}
+if [ "$scenario" = "fail" ]; then
+  echo "curl: (22) synthetic failure" >&2
   exit 22
 fi
-exit 0
+
+candidate_url=${STUB_CANDIDATE_URL:-https://candidate.vercel.app}
+if [ "$scenario" = "alias_login" ]; then
+  if [ "$url" = "$candidate_url" ]; then
+    printf '200 %s\n' "$url"
+  else
+    printf '200 https://vercel.com/login?sso=1\n'
+  fi
+  exit 0
+fi
+if [ "$scenario" = "candidate_login" ]; then
+  printf '200 https://vercel.com/login?sso=1\n'
+  exit 0
+fi
+if [ "$scenario" = "candidate_login_3xx" ]; then
+  printf '307 https://vercel.com/login?sso=1\n'
+  exit 0
+fi
+
+printf '200 %s\n' "$url"
 STUB
   chmod +x "$STUB_DIR/curl"
 
@@ -330,14 +428,51 @@ test_static_contract() {
   if [ "$token_env_count" -ne 1 ]; then
     fail "VERCEL_TOKEN must appear in exactly one step env, found $token_env_count"
   fi
-  if awk '/^  workflow_call:/,/^permissions:/' "$WORKFLOW_FILE" | grep -Fq "secrets:"; then
-    fail "workflow_call must not declare secrets"
+
+  # Optional Protection Bypass secret: declared once in workflow_call, and its
+  # value referenced only in the smoke step env.
+  local bypass_call_decl bypass_env_count
+  bypass_call_decl=$(extract_workflow_call_secrets)
+  if ! printf '%s\n' "$bypass_call_decl" | grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET:"; then
+    fail "workflow_call must declare the optional VERCEL_AUTOMATION_BYPASS_SECRET"
   fi
+  if ! printf '%s\n' "$bypass_call_decl" | grep -Fq "required: false"; then
+    fail "VERCEL_AUTOMATION_BYPASS_SECRET must be optional (required: false)"
+  fi
+
+  bypass_env_count=$(grep -Fc 'VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}' "$WORKFLOW_FILE")
+  if [ "$bypass_env_count" -ne 1 ]; then
+    fail "the bypass secret must be wired into exactly one env block, found $bypass_env_count"
+  fi
+
+  extract_step_block "Smoke staging candidate and aliases" "$TMP_ROOT/smoke-block.yml"
+  extract_step_block "Vercel control-plane deploy/promote" "$TMP_ROOT/control-block.yml"
+  extract_step_block "Build Vercel staging output" "$TMP_ROOT/build-block.yml"
+  extract_step_block "Finalize staging result" "$TMP_ROOT/finalize-block.yml"
+
+  if ! grep -Fq 'VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}' "$TMP_ROOT/smoke-block.yml"; then
+    fail "the bypass secret must be in the smoke step env"
+  fi
+  local block
+  for block in control build finalize; do
+    if grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET" "$TMP_ROOT/$block-block.yml"; then
+      fail "the bypass secret must not appear in the $block step"
+    fi
+  done
   if grep -Fq "set -x" "$STEPS_DIR/control-plane.sh"; then
     fail "token-bearing control-plane step must not enable shell tracing"
   fi
+  if grep -Fq "set -x" "$STEPS_DIR/smoke.sh"; then
+    fail "smoke step must not enable shell tracing"
+  fi
+  if ! grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET not configured" "$TMP_ROOT/smoke-block.yml"; then
+    fail "the smoke step must fail closed with the documented missing-secret message"
+  fi
+  if grep -Fq "::warning::" "$TMP_ROOT/smoke-block.yml"; then
+    fail "the smoke step must not downgrade the missing bypass secret to a warning"
+  fi
 
-  pass "static workflow contract is artifact-free and token-scoped"
+  pass "static workflow contract is artifact-free and secrets are step-scoped"
 }
 
 test_preflight_vercel_cli() {
@@ -489,23 +624,32 @@ test_control_plane_failure_modes() {
   pass "control-plane failures roll back or incident without leaking token"
 }
 
+set_smoke_env() {
+  export PATH="$STUB_DIR:$PATH"
+  export GITHUB_OUTPUT="$TMP_ROOT/smoke-output"
+  export CURL_BIN="$STUB_DIR/curl"
+  export CURL_LOG="$TMP_ROOT/curl.log"
+  export CURL_ARGV_LOG="$TMP_ROOT/curl-argv.log"
+  export DEPLOYMENT_URL=https://candidate.vercel.app
+  export PROMOTED_ALIASES=pythonlife.org,staging.lm.fm
+  export VERCEL_STATE_DIR="$TMP_ROOT/vercel-state"
+  export VERCEL_LOG="$TMP_ROOT/vercel.log"
+  unset CURL_SCENARIO VERCEL_AUTOMATION_BYPASS_SECRET EXPECTED_BYPASS_SECRET
+  : > "$GITHUB_OUTPUT"
+  : > "$CURL_LOG"
+  : > "$CURL_ARGV_LOG"
+  : > "$VERCEL_LOG"
+}
+
 test_post_promotion_smoke_incident() {
   local out="$TMP_ROOT/smoke.out"
-  local output="$TMP_ROOT/smoke-output"
   local vercel_log_before
   local vercel_log_after
 
-  export GITHUB_OUTPUT="$output"
-  export CURL_BIN="$STUB_DIR/curl"
-  export CURL_LOG="$TMP_ROOT/curl.log"
-  export DEPLOYMENT_URL=https://candidate.vercel.app
-  export PROMOTED_ALIASES=pythonlife.org,staging.lm.fm
-  : > "$GITHUB_OUTPUT"
-  : > "$CURL_LOG"
-  : > "$TMP_ROOT/vercel.log"
-  vercel_log_before=$(wc -c < "$TMP_ROOT/vercel.log")
-  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_FAIL=1 || fail "smoke failure should be managed"
-  vercel_log_after=$(wc -c < "$TMP_ROOT/vercel.log")
+  set_smoke_env
+  vercel_log_before=$(wc -c < "$VERCEL_LOG")
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=fail || fail "smoke failure should be managed"
+  vercel_log_after=$(wc -c < "$VERCEL_LOG")
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
     fail "smoke failure should emit failed"
   fi
@@ -515,6 +659,147 @@ test_post_promotion_smoke_incident() {
   assert_file_contains "$out" "manual-recovery incident"
 
   pass "post-promotion smoke failure is a manual-recovery incident"
+}
+
+test_smoke_bypass_header_candidate_only() {
+  local out="$TMP_ROOT/smoke-bypass.out"
+  local candidate_line
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+    EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "bypass smoke should pass"
+
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "success" ]; then
+    fail "bypass smoke should emit success"
+  fi
+
+  candidate_line=$(grep -F 'url=https://candidate.vercel.app ' "$CURL_LOG" || true)
+  if [ -z "$candidate_line" ] || [[ "$candidate_line" != *"bypass_header=yes"* ]]; then
+    echo "curl log:" >&2
+    cat "$CURL_LOG" >&2 || true
+    fail "candidate smoke did not send the protection bypass header"
+  fi
+  if [[ "$candidate_line" != *"bypass_value=correct"* ]]; then
+    echo "curl log:" >&2
+    cat "$CURL_LOG" >&2 || true
+    fail "candidate smoke did not send the configured bypass value"
+  fi
+  if [[ "$candidate_line" == *"env_has_secret=yes"* ]]; then
+    fail "the bypass secret must not be inherited by the candidate curl process"
+  fi
+
+  for alias in pythonlife.org staging.lm.fm; do
+    local alias_line
+    alias_line=$(grep -F "url=https://${alias} " "$CURL_LOG" || true)
+    if [ -z "$alias_line" ]; then
+      fail "alias $alias was not smoked"
+    fi
+    if [[ "$alias_line" == *"bypass_header=yes"* ]]; then
+      fail "alias $alias must be smoked without the bypass header"
+    fi
+    if [[ "$alias_line" == *"env_has_secret=yes"* ]]; then
+      fail "alias $alias must not inherit the bypass secret"
+    fi
+  done
+
+  if ! grep -Fq -- "--config" "$CURL_ARGV_LOG"; then
+    fail "candidate smoke must feed the header through curl config on stdin"
+  fi
+
+  assert_file_not_contains "$CURL_ARGV_LOG" "synthetic-bypass-value"
+  assert_file_not_contains "$CURL_LOG" "synthetic-bypass-value"
+  assert_file_not_contains "$out" "synthetic-bypass-value"
+
+  pass "bypass header applies to the candidate only and stays out of argv/logs"
+}
+
+test_smoke_without_bypass_fails_closed() {
+  local out="$TMP_ROOT/smoke-no-bypass.out"
+  local curl_count
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" || fail "missing bypass is a managed smoke failure"
+
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "missing bypass must fail the staging gate closed"
+  fi
+
+  assert_file_contains "$out" "::error"
+  assert_file_contains "$out" "VERCEL_AUTOMATION_BYPASS_SECRET not configured"
+  assert_file_not_contains "$out" "::warning::"
+  assert_file_not_contains "$out" "smoke skipped"
+
+  if grep -Fq "url=https://candidate.vercel.app " "$CURL_LOG"; then
+    fail "candidate must not be smoked when the bypass secret is absent"
+  fi
+  curl_count=$(wc -l < "$CURL_LOG")
+  if [ "$curl_count" -ne 2 ]; then
+    echo "curl log:" >&2
+    cat "$CURL_LOG" >&2 || true
+    fail "expected both aliases and only both aliases to be smoked, got $curl_count request(s)"
+  fi
+  if grep -Fq "bypass_header=yes" "$CURL_LOG"; then
+    fail "alias smoke must stay tokenless"
+  fi
+
+  pass "absent bypass fails closed with the required error and no skip path"
+}
+
+test_smoke_login_redirect_is_failure() {
+  local out="$TMP_ROOT/smoke-login.out"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_login \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "login redirect is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "candidate login redirect must fail the smoke"
+  fi
+  assert_file_contains "$out" "manual-recovery incident"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_login_3xx \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "3xx login redirect is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "candidate 3xx login redirect must fail the smoke"
+  fi
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value || fail "alias login redirect is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "alias login redirect must fail the smoke, even with a bypass secret"
+  fi
+  assert_file_contains "$out" "manual-recovery incident"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login || fail "alias login redirect is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "alias login redirect must fail the smoke without a bypass secret"
+  fi
+
+  pass "Vercel login/SSO redirects fail the smoke instead of passing"
+}
+
+test_smoke_rejects_unsafe_bypass_value() {
+  local out="$TMP_ROOT/smoke-unsafe.out"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" \
+    'VERCEL_AUTOMATION_BYPASS_SECRET=bad"value' || fail "unsafe bypass value is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "unsafe bypass value must fail the smoke before any request"
+  fi
+  assert_file_contains "$out" "Invalid protection bypass secret"
+  if grep -Fq "url=https://candidate.vercel.app " "$CURL_LOG"; then
+    fail "unsafe bypass value must not trigger a candidate request"
+  fi
+  if grep -Fq "bypass_header=yes" "$CURL_LOG"; then
+    fail "unsafe bypass value must never be written into a curl config"
+  fi
+  assert_file_not_contains "$out" 'bad"value'
+
+  pass "bypass value is validated before it is written into the curl config"
 }
 
 test_finalize_result_gate() {
@@ -562,6 +847,10 @@ test_prepare_alias_allowlist
 test_control_plane_success_and_superseded
 test_control_plane_failure_modes
 test_post_promotion_smoke_incident
+test_smoke_bypass_header_candidate_only
+test_smoke_without_bypass_fails_closed
+test_smoke_login_redirect_is_failure
+test_smoke_rejects_unsafe_bypass_value
 test_finalize_result_gate
 test_shell_validation
 
