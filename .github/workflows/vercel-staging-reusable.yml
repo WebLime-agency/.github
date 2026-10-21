@@ -21,8 +21,10 @@ name: Vercel Staging Deploy (reusable)
 #   reusable. Callers pass it through secrets:. The candidate URL smoke fails
 #   closed with "VERCEL_AUTOMATION_BYPASS_SECRET not configured" until the
 #   secret is provisioned, because standard Deployment Protection serves a
-#   Vercel login redirect on the raw candidate URL. The public staging aliases
-#   are always smoked tokenlessly.
+#   Vercel login redirect on the raw candidate URL. The candidate check never
+#   follows redirects, because curl would forward the bypass header to the
+#   redirect target. Any candidate 3xx fails the smoke. The public staging
+#   aliases are always smoked tokenlessly and may follow redirects.
 
 on:
   workflow_call:
@@ -561,23 +563,33 @@ jobs:
 
           # Smoke one URL. When a bypass secret is supplied, the header is fed
           # to curl through a config on stdin so the value never appears in
-          # process argv. The returned line is "<http_code> <effective_url>".
+          # process argv and is never inherited through the environment.
+          #
+          # curl forwards custom headers to every redirect target, so the
+          # candidate request never follows redirects: any 3xx fails the check
+          # instead of carrying the bypass secret to another host. Alias
+          # requests are tokenless and may follow redirects, and their final
+          # URL is inspected for a Vercel login/SSO landing page.
+          #
+          # The returned line is "<http_code> <effective_url>".
           smoke_url() {
             local url=$1
-            local bypass_secret=${2:-}
+            local bypass_secret=$2
+            local follow_redirects=$3
             local result
+
+            local curl_args=(--silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code} %{url_effective}')
+            if [ "$follow_redirects" = "true" ]; then
+              curl_args+=(--location --max-redirs 5)
+            fi
 
             if [ -n "$bypass_secret" ]; then
               result=$(
                 printf 'header = "x-vercel-protection-bypass: %s"\n' "$bypass_secret" |
-                  "$CURL_BIN" --config - --silent --show-error --location --max-redirs 5 \
-                    --max-time 20 --output /dev/null --write-out '%{http_code} %{url_effective}' "$url"
+                  "$CURL_BIN" --config - "${curl_args[@]}" "$url"
               )
             else
-              result=$(
-                "$CURL_BIN" --silent --show-error --location --max-redirs 5 \
-                  --max-time 20 --output /dev/null --write-out '%{http_code} %{url_effective}' "$url"
-              )
+              result=$("$CURL_BIN" "${curl_args[@]}" "$url")
             fi
 
             printf '%s\n' "$result"
@@ -587,6 +599,7 @@ jobs:
             local label=$1
             local url=$2
             local bypass_secret=${3:-}
+            local follow_redirects=${4:-true}
             local result http_code effective_url
 
             if [ -z "$url" ]; then
@@ -594,7 +607,7 @@ jobs:
               smoke_failed=true
               return 0
             fi
-            if ! result=$(smoke_url "$url" "$bypass_secret"); then
+            if ! result=$(smoke_url "$url" "$bypass_secret" "$follow_redirects"); then
               echo "::error title=Staging smoke request failed::$label request to $url did not complete."
               smoke_failed=true
               return 0
@@ -613,6 +626,10 @@ jobs:
             fi
             case "$http_code" in
               2??)
+                ;;
+              3??)
+                echo "::error title=Staging smoke unexpected redirect::$label returned HTTP $http_code to $effective_url. Redirects are not followed for this check."
+                smoke_failed=true
                 ;;
               *)
                 echo "::error title=Staging smoke HTTP failure::$label returned HTTP $http_code."
@@ -646,13 +663,13 @@ jobs:
             echo "::error title=Staging smoke missing protection bypass::VERCEL_AUTOMATION_BYPASS_SECRET not configured. Configure Protection Bypass for Automation on the staging Vercel project and pass the secret from the caller."
             smoke_failed=true
           elif [ -n "$candidate_bypass_secret" ]; then
-            check_url "candidate" "$DEPLOYMENT_URL" "$candidate_bypass_secret"
+            check_url "candidate" "$DEPLOYMENT_URL" "$candidate_bypass_secret" false
           fi
 
           # Alias hosts are public by design: always tokenless, no bypass header.
           IFS=',' read -r -a aliases_array <<< "$PROMOTED_ALIASES"
           for alias in "${aliases_array[@]}"; do
-            check_url "alias ${alias}" "https://${alias}"
+            check_url "alias ${alias}" "https://${alias}" "" true
           done
 
           if [ "$smoke_failed" = "true" ]; then

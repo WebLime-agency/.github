@@ -238,6 +238,13 @@ if [ "$config_requested" = "1" ]; then
   config="$(cat)"
 fi
 
+follows_redirects=no
+for arg in "${args[@]}"; do
+  if [ "$arg" = "--location" ] || [ "$arg" = "-L" ]; then
+    follows_redirects=yes
+  fi
+done
+
 bypass_header=no
 bypass_value=absent
 if printf '%s\n' "$config" | grep -Fq 'x-vercel-protection-bypass:'; then
@@ -255,8 +262,8 @@ if [ -n "${VERCEL_AUTOMATION_BYPASS_SECRET:-}" ]; then
   env_has_secret=yes
 fi
 
-printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s\n' \
-  "$url" "$bypass_header" "$bypass_value" "$env_has_secret" >> "${CURL_LOG:?}"
+printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s follows_redirects=%s\n' \
+  "$url" "$bypass_header" "$bypass_value" "$env_has_secret" "$follows_redirects" >> "${CURL_LOG:?}"
 for arg in "${args[@]}"; do
   printf '%s\n' "$arg" >> "${CURL_ARGV_LOG:?}"
 done
@@ -282,6 +289,14 @@ if [ "$scenario" = "candidate_login" ]; then
 fi
 if [ "$scenario" = "candidate_login_3xx" ]; then
   printf '307 https://vercel.com/login?sso=1\n'
+  exit 0
+fi
+if [ "$scenario" = "candidate_redirect_3xx" ]; then
+  if [ "$follows_redirects" = "yes" ]; then
+    printf '200 %s\n' "$url"
+  else
+    printf '302 https://elsewhere.example.com/landing\n'
+  fi
   exit 0
 fi
 
@@ -701,6 +716,9 @@ test_smoke_bypass_header_candidate_only() {
   if [[ "$candidate_line" == *"env_has_secret=yes"* ]]; then
     fail "the bypass secret must not be inherited by the candidate curl process"
   fi
+  if [[ "$candidate_line" != *"follows_redirects=no"* ]]; then
+    fail "candidate smoke must not follow redirects while carrying the bypass header"
+  fi
 
   for alias in pythonlife.org staging.lm.fm; do
     local alias_line
@@ -714,6 +732,9 @@ test_smoke_bypass_header_candidate_only() {
     if [[ "$alias_line" == *"env_has_secret=yes"* ]]; then
       fail "alias $alias must not inherit the bypass secret"
     fi
+    if [[ "$alias_line" != *"follows_redirects=yes"* ]]; then
+      fail "alias $alias smoke must follow redirects so the landing URL is inspected"
+    fi
   done
 
   if ! grep -Fq -- "--config" "$CURL_ARGV_LOG"; then
@@ -725,6 +746,31 @@ test_smoke_bypass_header_candidate_only() {
   assert_file_not_contains "$out" "synthetic-bypass-value"
 
   pass "bypass header applies to the candidate only and stays out of argv/logs"
+}
+
+test_smoke_candidate_redirect_fails_without_following() {
+  local out="$TMP_ROOT/smoke-candidate-redirect.out"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_redirect_3xx \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+    EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "candidate redirect is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "a candidate redirect must fail the smoke instead of being followed with the bypass header"
+  fi
+  assert_file_contains "$out" "Staging smoke unexpected redirect"
+  assert_file_contains "$out" "https://elsewhere.example.com/landing"
+  assert_file_contains "$out" "manual-recovery incident"
+
+  if ! grep -F 'url=https://candidate.vercel.app ' "$CURL_LOG" | grep -Fq 'follows_redirects=no'; then
+    echo "curl log:" >&2
+    cat "$CURL_LOG" >&2 || true
+    fail "candidate smoke must issue the redirect check without following redirects"
+  fi
+  assert_file_not_contains "$CURL_LOG" "synthetic-bypass-value"
+  assert_file_not_contains "$out" "synthetic-bypass-value"
+
+  pass "candidate redirects fail closed instead of forwarding the bypass header"
 }
 
 test_smoke_without_bypass_fails_closed() {
@@ -861,6 +907,7 @@ test_control_plane_success_and_superseded
 test_control_plane_failure_modes
 test_post_promotion_smoke_incident
 test_smoke_bypass_header_candidate_only
+test_smoke_candidate_redirect_fails_without_following
 test_smoke_without_bypass_fails_closed
 test_smoke_login_redirect_is_failure
 test_smoke_rejects_unsafe_bypass_value
