@@ -9,6 +9,9 @@ name: Vercel Staging Deploy (reusable)
 # Operator preconditions:
 # - Provision /opt/weblime/vercel/56.3.1/vercel from vercel@56.3.1 dist/vc.js,
 #   root-owned, not group/world-writable, immutable where feasible.
+# - Provision the exact Node.js release named by the consumer's
+#   node_version_file at /usr/bin/node, root-owned and not
+#   group/world-writable. This reusable never resolves node through PATH.
 # - Keep the consumer repo's staging environment secret VERCEL_TOKEN dedicated
 #   to staging, team-scoped for WebLime Vercel, and distinct from production.
 # - Own rotation/revocation and the manual recovery runbook for post-promotion
@@ -55,7 +58,7 @@ on:
         description: "Comma-joined aliases promoted to the candidate."
         value: ${{ jobs.deploy-staging.outputs.promoted_aliases }}
       result:
-        description: "success, superseded, failed, rolled_back, or rollback_failed."
+        description: "success, superseded, failed, rolled_back, or rollback_failed. Caller contract: superseded means restart, not deployment success; failed, rolled_back, and rollback_failed need failure handling; a post-promotion `failed` requires manual recovery; results from a failed reusable job must be read from this output, not inferred from job status alone."
         value: ${{ jobs.deploy-staging.outputs.result }}
 
 permissions:
@@ -178,9 +181,21 @@ jobs:
           JQ_BIN="$(resolve_path_tool jq)"
           PYTHON_BIN="/usr/bin/python3"
           require_abs_tool "python3" "$PYTHON_BIN"
+          NODE_BIN="/usr/bin/node"
+          require_abs_tool "node" "$NODE_BIN"
           require_abs_tool "vercel" "$EXPECTED_VERCEL_CLI_PATH"
 
-          VERCEL_VERSION_OUTPUT="$("$EXPECTED_VERCEL_CLI_PATH" --version 2>/dev/null || true)"
+          # The CLI is a Node entrypoint. Always start it through the
+          # preflighted absolute interpreter with a sanitized startup
+          # environment, never through /usr/bin/env node on PATH.
+          run_vercel_cli() {
+            (
+              cd "${RUNNER_TEMP:-/tmp}"
+              NODE_OPTIONS='' NODE_PATH='' "$NODE_BIN" -- "$EXPECTED_VERCEL_CLI_PATH" "$@"
+            )
+          }
+
+          VERCEL_VERSION_OUTPUT="$(run_vercel_cli --version 2>/dev/null || true)"
           VERCEL_VERSION_LINE=""
           while IFS= read -r version_line; do
             version_line=${version_line%$'\r'}
@@ -204,6 +219,7 @@ jobs:
             echo "curl=$CURL_BIN"
             echo "jq=$JQ_BIN"
             echo "python=$PYTHON_BIN"
+            echo "node=$NODE_BIN"
             echo "vercel=$EXPECTED_VERCEL_CLI_PATH"
           } >> "$GITHUB_OUTPUT"
 
@@ -248,6 +264,7 @@ jobs:
       - name: Build Vercel staging output
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          NODE_BIN: ${{ steps.tools.outputs.node }}
           VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
@@ -271,7 +288,7 @@ jobs:
             exit 1
           fi
 
-          "$VERCEL_BIN" build
+          "$NODE_BIN" -- "$VERCEL_BIN" build
 
           if [ ! -d .vercel/output ] || [ ! -f .vercel/output/config.json ]; then
             echo "::error title=Missing Vercel output::vercel build did not create .vercel/output/config.json."
@@ -329,6 +346,7 @@ jobs:
           NEUTRAL_DIR: ${{ runner.temp }}
           JQ_BIN: ${{ steps.tools.outputs.jq }}
           PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          NODE_BIN: ${{ steps.tools.outputs.node }}
           VERCEL_BIN: ${{ steps.tools.outputs.vercel }}
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
@@ -336,6 +354,19 @@ jobs:
         working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
+
+          # Sanitize the process environment so the Node CLI cannot be started
+          # with PATH-resolved node or injected Node options in this
+          # token-bearing step.
+          unset NODE_OPTIONS NODE_PATH
+          export NODE_NO_WARNINGS=1
+
+          run_vercel() {
+            (
+              cd "${NEUTRAL_DIR}"
+              NODE_OPTIONS='' NODE_PATH='' HOME="$NEUTRAL_DIR" "$NODE_BIN" -- "$VERCEL_BIN" "$@"
+            )
+          }
 
           promoted_aliases=()
           rollback_prefix="${NEUTRAL_DIR}/vercel-staging-rollback-${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
@@ -399,7 +430,7 @@ jobs:
 
           inspect_json() {
             local target=$1
-            "$VERCEL_BIN" inspect "$target" --wait --token="$VERCEL_TOKEN" --json
+            run_vercel inspect "$target" --wait --token="$VERCEL_TOKEN" --json
           }
 
           verify_ready() {
@@ -458,7 +489,7 @@ jobs:
                 continue
               fi
               IFS= read -r target < "$rollback_prefix-$alias.target"
-              if ! "$VERCEL_BIN" alias set "$target" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+              if ! run_vercel alias set "$target" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
                 echo "::error title=Rollback alias set failed::Failed to restore $alias."
                 rollback_failed=true
                 continue
@@ -489,7 +520,7 @@ jobs:
             exit 0
           fi
 
-          deploy_output="$("$VERCEL_BIN" deploy --prebuilt --token="$VERCEL_TOKEN")"
+          deploy_output="$(run_vercel deploy --prebuilt --token="$VERCEL_TOKEN")"
           if ! deployment_url="$(parse_deploy_url "$deploy_output")"; then
             echo "::error title=Unable to parse deployment URL::vercel deploy did not return an immutable deployment URL."
             set_result "failed"
@@ -517,7 +548,7 @@ jobs:
           fi
 
           for alias in "${aliases_array[@]}"; do
-            if ! "$VERCEL_BIN" alias set "$deployment_url" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+            if ! run_vercel alias set "$deployment_url" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
               echo "::error title=Staging alias promotion failed::Failed to point $alias at the candidate deployment; attempting rollback."
               rollback_aliases || true
               exit 0
@@ -571,25 +602,35 @@ jobs:
           # requests are tokenless and may follow redirects, and their final
           # URL is inspected for a Vercel login/SSO landing page.
           #
-          # The returned line is "<http_code> <effective_url>".
+          # The returned line is "<http_code> <effective_url>". A curl
+          # transport failure is returned as a nonzero status instead of a
+          # response line, even when headers were already written.
           smoke_url() {
             local url=$1
             local bypass_secret=$2
             local follow_redirects=$3
             local result
+            local curl_status
 
             local curl_args=(--silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code} %{url_effective}')
             if [ "$follow_redirects" = "true" ]; then
               curl_args+=(--location --max-redirs 5)
             fi
 
+            set +e
             if [ -n "$bypass_secret" ]; then
               result=$(
                 printf 'header = "x-vercel-protection-bypass: %s"\n' "$bypass_secret" |
-                  "$CURL_BIN" --config - "${curl_args[@]}" "$url"
+                  "$CURL_BIN" --disable --config - "${curl_args[@]}" "$url"
               )
             else
-              result=$("$CURL_BIN" "${curl_args[@]}" "$url")
+              result=$("$CURL_BIN" --disable "${curl_args[@]}" "$url")
+            fi
+            curl_status=$?
+            set -e
+
+            if [ "$curl_status" -ne 0 ]; then
+              return "$curl_status"
             fi
 
             printf '%s\n' "$result"

@@ -122,6 +122,7 @@ extract_steps() {
   mkdir -p "$STEPS_DIR"
   extract_step "Preflight trusted tools" "$STEPS_DIR/preflight.sh"
   extract_step "Verify exact source" "$STEPS_DIR/verify-source.sh"
+  extract_step "Build Vercel staging output" "$STEPS_DIR/build.sh"
   extract_step "Prepare staging aliases" "$STEPS_DIR/prepare-aliases.sh"
   extract_step "Vercel control-plane deploy/promote" "$STEPS_DIR/control-plane.sh"
   extract_step "Smoke staging candidate and aliases" "$STEPS_DIR/smoke.sh"
@@ -136,6 +137,7 @@ materialize_preflight() {
     s#/usr/bin/stat#$ENV{STUB_DIR}/stat#g;
     s#/usr/bin/sha256sum#$ENV{STUB_DIR}/sha256sum#g;
     s#/usr/bin/python3#$ENV{STUB_DIR}/python3-trusted#g;
+    s#/usr/bin/node#$ENV{STUB_DIR}/node-trusted#g;
     s#/opt/weblime/vercel/56\.3\.1/vercel#$ENV{STUB_DIR}/vercel-trusted#g;
   ' "$output_file"
 }
@@ -184,6 +186,40 @@ exec /usr/bin/python3 "$@"
 STUB
   chmod +x "$STUB_DIR/python3-trusted"
 
+  cat > "$STUB_DIR/node-trusted" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "node" >> "${NODE_LOG:?}"
+printf 'node-options=%s\n' "${NODE_OPTIONS:-}" >> "${NODE_LOG:?}"
+printf 'node-path=%s\n' "${NODE_PATH:-}" >> "${NODE_LOG:?}"
+if [ "${NODE_FORCE_FAIL:-0}" = "1" ]; then
+  echo "synthetic node startup failure" >&2
+  exit 97
+fi
+if [ "${1:-}" = "--version" ]; then
+  exec /usr/bin/node --version
+fi
+while [ -n "${1:-}" ] && [ "${1#-}" != "$1" ] && [ "${1:-}" != "--" ]; do
+  shift
+done
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+script=${1:?}
+shift
+exec /usr/bin/node "$script" "$@"
+STUB
+  chmod +x "$STUB_DIR/node-trusted"
+
+  cat > "$STUB_DIR/node" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "PATH-resolved node must not run" >> "${PATH_NODE_MARKER:?}"
+exit 98
+STUB
+  chmod +x "$STUB_DIR/node"
+
   cat > "$STUB_DIR/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -224,6 +260,10 @@ args=("$@")
 url=${!#}
 write_out=""
 config_requested=0
+defaults_disabled=no
+if [ "${args[0]:-}" = "--disable" ] || [ "${args[0]:-}" = "-q" ]; then
+  defaults_disabled=yes
+fi
 for ((i = 0; i < ${#args[@]}; i++)); do
   if [ "${args[$i]}" = "--write-out" ]; then
     write_out=${args[$((i + 1))]:-}
@@ -245,6 +285,17 @@ for arg in "${args[@]}"; do
   fi
 done
 
+# Model curl's documented default-config behavior: unless -q/--disable is the
+# first argument, an inherited .curlrc can re-enable redirects or verbose
+# tracing even when --location is absent from argv.
+default_config_used=no
+if [ "$defaults_disabled" = "no" ] && [ -f "${HOME:-}/.curlrc" ]; then
+  default_config_used=yes
+  if grep -Eq '(^|[[:space:]])location([[:space:]]|$)' "${HOME}/.curlrc"; then
+    follows_redirects=yes
+  fi
+fi
+
 bypass_header=no
 bypass_value=absent
 if printf '%s\n' "$config" | grep -Fq 'x-vercel-protection-bypass:'; then
@@ -262,8 +313,9 @@ if [ -n "${VERCEL_AUTOMATION_BYPASS_SECRET:-}" ]; then
   env_has_secret=yes
 fi
 
-printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s follows_redirects=%s\n' \
-  "$url" "$bypass_header" "$bypass_value" "$env_has_secret" "$follows_redirects" >> "${CURL_LOG:?}"
+printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s follows_redirects=%s defaults_disabled=%s default_config_used=%s\n' \
+  "$url" "$bypass_header" "$bypass_value" "$env_has_secret" "$follows_redirects" "$defaults_disabled" "$default_config_used" >> "${CURL_LOG:?}"
+printf 'first_arg=%s\n' "${args[0]:-}" >> "${CURL_LOG:?}"
 for arg in "${args[@]}"; do
   printf '%s\n' "$arg" >> "${CURL_ARGV_LOG:?}"
 done
@@ -299,6 +351,16 @@ if [ "$scenario" = "candidate_redirect_3xx" ]; then
   fi
   exit 0
 fi
+if [ "$scenario" = "candidate_transport_fail" ]; then
+  printf '200 %s\n' "$url"
+  echo "curl: (28) synthetic timeout after response headers" >&2
+  exit 28
+fi
+if [ "$scenario" = "alias_transport_fail" ] && [ "$url" != "$candidate_url" ]; then
+  printf '200 %s\n' "$url"
+  echo "curl: (28) synthetic timeout after response headers" >&2
+  exit 28
+fi
 
 printf '200 %s\n' "$url"
 STUB
@@ -313,88 +375,106 @@ STUB
   chmod +x "$STUB_DIR/vercel"
 
   cat > "$STUB_DIR/vercel-trusted" <<'STUB'
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env node
+'use strict';
 
-state_dir=${VERCEL_STATE_DIR:?}
-log_file=${VERCEL_LOG:?}
-mkdir -p "$state_dir"
+const fs = require('fs');
+const path = require('path');
 
-alias_file() {
-  local alias=$1
-  alias=${alias//./_}
-  printf '%s/%s.target\n' "$state_dir" "$alias"
+const stateDir = process.env.VERCEL_STATE_DIR;
+const logFile = process.env.VERCEL_LOG;
+if (!stateDir || !logFile) {
+  console.error('VERCEL_STATE_DIR and VERCEL_LOG are required');
+  process.exit(2);
+}
+fs.mkdirSync(stateDir, { recursive: true });
+
+const mode = process.env.VERCEL_MODE || 'success';
+
+function log(line) {
+  fs.appendFileSync(logFile, line + '\n');
 }
 
-if [ "${1:-}" = "--version" ]; then
-  echo "${VERCEL_STUB_VERSION:-56.3.1}"
-  exit 0
-fi
+function aliasFile(alias) {
+  return path.join(stateDir, alias.split('.').join('_') + '.target');
+}
 
-case "${1:-}" in
-  build)
-    mkdir -p .vercel/output
-    printf '{}\n' > .vercel/output/config.json
-    echo "build" >> "$log_file"
-    ;;
-  deploy)
-    echo "deploy" >> "$log_file"
-    if [ "${VERCEL_MODE:-success}" = "deploy_malformed" ]; then
-      echo "no deployment url here"
-    else
-      echo "https://candidate.vercel.app"
-    fi
-    ;;
-  inspect)
-    target=${2:?}
-    echo "inspect $target" >> "$log_file"
-    if [ "${VERCEL_MODE:-success}" = "malformed_inspect" ]; then
-      echo "not json"
-      exit 0
-    fi
-    case "$target" in
-      https://candidate.vercel.app)
-        printf '{"readyState":"READY","url":"candidate.vercel.app"}\n'
-        ;;
-      https://pythonlife.org|https://staging.lm.fm)
-        alias=${target#https://}
-        file=$(alias_file "$alias")
-        if [ ! -f "$file" ]; then
-          printf 'https://old-%s.vercel.app\n' "$alias" > "$file"
-        fi
-        read -r current < "$file"
-        printf '{"readyState":"READY","target":"%s"}\n' "$current"
-        ;;
-      *)
-        printf '{"readyState":"READY","target":"%s"}\n' "$target"
-        ;;
-    esac
-    ;;
-  alias)
-    if [ "${2:-}" != "set" ]; then
-      echo "unexpected alias invocation: $*" >&2
-      exit 2
-    fi
-    target=${3:?}
-    alias=${4:?}
-    echo "alias set $target $alias" >> "$log_file"
-    if [ "${FAIL_SECOND_ALIAS:-0}" = "1" ] && [ "$alias" = "staging.lm.fm" ] && [ "$target" = "https://candidate.vercel.app" ]; then
-      exit 44
-    fi
-    if [ "${ROLLBACK_FAIL:-0}" = "1" ]; then
-      case "$target" in
-        https://old-*.vercel.app)
-          exit 45
-          ;;
-      esac
-    fi
-    printf '%s\n' "$target" > "$(alias_file "$alias")"
-    ;;
-  *)
-    echo "unexpected vercel invocation: $*" >&2
-    exit 2
-    ;;
-esac
+const argv = process.argv.slice(2);
+const command = argv[0];
+
+if (command === '--version') {
+  process.stdout.write((process.env.VERCEL_STUB_VERSION || '56.3.1') + '\n');
+  process.exit(0);
+}
+
+switch (command) {
+  case 'build':
+    fs.mkdirSync(path.join('.vercel', 'output'), { recursive: true });
+    fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), '{}\n');
+    log('build');
+    break;
+  case 'deploy':
+    log('deploy');
+    if (mode === 'deploy_malformed') {
+      process.stdout.write('no deployment url here\n');
+    } else {
+      process.stdout.write('https://candidate.vercel.app\n');
+    }
+    break;
+  case 'inspect': {
+    const target = argv[1];
+    if (!target) {
+      console.error('inspect requires a target');
+      process.exit(2);
+    }
+    log('inspect ' + target);
+    if (mode === 'malformed_inspect') {
+      process.stdout.write('not json\n');
+      break;
+    }
+    if (target === 'https://candidate.vercel.app') {
+      process.stdout.write(JSON.stringify({ readyState: 'READY', url: 'candidate.vercel.app' }) + '\n');
+      break;
+    }
+    if (target === 'https://pythonlife.org' || target === 'https://staging.lm.fm') {
+      const alias = target.slice('https://'.length);
+      const file = aliasFile(alias);
+      if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, 'https://old-' + alias + '.vercel.app\n');
+      }
+      const current = fs.readFileSync(file, 'utf8').split('\n')[0];
+      process.stdout.write(JSON.stringify({ readyState: 'READY', target: current }) + '\n');
+      break;
+    }
+    process.stdout.write(JSON.stringify({ readyState: 'READY', target }) + '\n');
+    break;
+  }
+  case 'alias': {
+    if (argv[1] !== 'set') {
+      console.error('unexpected alias invocation: ' + argv.join(' '));
+      process.exit(2);
+    }
+    const target = argv[2];
+    const alias = argv[3];
+    if (!target || !alias) {
+      console.error('alias set requires a target and an alias');
+      process.exit(2);
+    }
+    log('alias set ' + target + ' ' + alias);
+    if (process.env.FAIL_SECOND_ALIAS === '1' && alias === 'staging.lm.fm' && target === 'https://candidate.vercel.app') {
+      process.exit(44);
+    }
+    if (process.env.ROLLBACK_FAIL === '1' && target.startsWith('https://old-') && target.endsWith('.vercel.app')) {
+      process.exit(45);
+    }
+    fs.writeFileSync(aliasFile(alias), target + '\n');
+    break;
+  }
+  default:
+    console.error('unexpected vercel invocation: ' + argv.join(' '));
+    process.exit(2);
+}
+
 STUB
   chmod +x "$STUB_DIR/vercel-trusted"
 }
@@ -418,10 +498,14 @@ common_preflight_env() {
   export VERCEL_STATE_DIR="$TMP_ROOT/vercel-state"
   export VERCEL_LOG="$TMP_ROOT/vercel.log"
   export PATH_VERCEL_MARKER="$TMP_ROOT/path-vercel-marker"
+  export PATH_NODE_MARKER="$TMP_ROOT/path-node-marker"
+  export NODE_LOG="$TMP_ROOT/node.log"
   unset BAD_OWNER_PATH BAD_MODE_PATH SHA_MODE VERCEL_STUB_VERSION
   : > "$GITHUB_OUTPUT"
   : > "$VERCEL_LOG"
   : > "$PATH_VERCEL_MARKER"
+  : > "$PATH_NODE_MARKER"
+  : > "$NODE_LOG"
 }
 
 test_static_contract() {
@@ -434,11 +518,17 @@ test_static_contract() {
   assert_file_contains "$WORKFLOW_FILE" "clean: true"
   assert_file_contains "$WORKFLOW_FILE" "fetch-depth: 0"
   assert_file_contains "$WORKFLOW_FILE" "https://github.com/eba8/mission-control/issues/413"
-  assert_file_contains "$WORKFLOW_FILE" "dedicated"
+assert_file_contains "$WORKFLOW_FILE" "dedicated"
   assert_file_not_contains "$WORKFLOW_FILE" "upload-artifact"
   assert_file_not_contains "$WORKFLOW_FILE" "download-artifact"
   assert_file_not_contains "$WORKFLOW_FILE" "npm install -g vercel"
   assert_file_not_contains "$WORKFLOW_FILE" "vercel pull"
+
+  # The caller result contract must be documented next to the interface, not
+  # only in issue discussion.
+  assert_file_contains "$WORKFLOW_FILE" "superseded means restart"
+  assert_file_contains "$WORKFLOW_FILE" "post-promotion \`failed\` requires manual recovery"
+  assert_file_contains "$WORKFLOW_FILE" "results from a failed reusable job"
 
   token_env_count=$(grep -Fc 'VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}' "$WORKFLOW_FILE")
   if [ "$token_env_count" -ne 1 ]; then
@@ -481,6 +571,15 @@ test_static_contract() {
   if grep -Fq "set -x" "$STEPS_DIR/smoke.sh"; then
     fail "smoke step must not enable shell tracing"
   fi
+  if ! grep -Fq "unset NODE_OPTIONS NODE_PATH" "$STEPS_DIR/control-plane.sh"; then
+    fail "the token-bearing control step must unset NODE_OPTIONS and NODE_PATH"
+  fi
+  if ! grep -Fq '"$NODE_BIN" -- "$VERCEL_BIN"' "$STEPS_DIR/control-plane.sh"; then
+    fail "the token-bearing control step must start the CLI through the preflighted node"
+  fi
+  if ! grep -Fq '"$NODE_BIN" -- "$VERCEL_BIN" build' "$STEPS_DIR/build.sh"; then
+    fail "the build step must start the CLI through the preflighted node"
+  fi
   if ! grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET not configured" "$TMP_ROOT/smoke-block.yml"; then
     fail "the smoke step must fail closed with the documented missing-secret message"
   fi
@@ -518,6 +617,31 @@ test_preflight_vercel_cli() {
   common_preflight_env
   run_script "$script" "$out" BAD_MODE_PATH="$STUB_DIR/git" && fail "writable git should fail"
   assert_file_contains "$out" "Unsafe git permissions"
+
+  common_preflight_env
+  run_script "$script" "$out" BAD_OWNER_PATH="$STUB_DIR/node-trusted" && fail "non-root node should fail"
+  assert_file_contains "$out" "Untrusted node owner"
+
+  common_preflight_env
+  run_script "$script" "$out" BAD_MODE_PATH="$STUB_DIR/node-trusted" && fail "writable node should fail"
+  assert_file_contains "$out" "Unsafe node permissions"
+
+  # A PATH-poisoned node or an injected NODE_OPTIONS must not be picked up by
+  # the CLI version probe.
+  common_preflight_env
+  export NODE_OPTIONS=--require=/tmp/poison-123456.js
+  run_script "$script" "$out" || fail "preflight should sanitize NODE_OPTIONS"
+  unset NODE_OPTIONS
+  if grep -Fq 'node-options=--require=/tmp/poison-123456.js' "$NODE_LOG"; then
+    fail "preflight passed NODE_OPTIONS through to node"
+  fi
+
+  if [ -s "$PATH_NODE_MARKER" ]; then
+    fail "PATH-resolved node was invoked during preflight"
+  fi
+  if ! grep -Fxq 'node-options=' "$NODE_LOG"; then
+    fail "preflight must invoke the CLI through a sanitized Node interpreter"
+  fi
 
   # A symlink whose target lives under a writable directory must be rejected
   # even though the lexical path itself looks safe.
@@ -586,17 +710,36 @@ set_control_env() {
   export JQ_BIN=/usr/bin/jq
   export PYTHON_BIN=/usr/bin/python3
   export VERCEL_BIN="$STUB_DIR/vercel-trusted"
+  export NODE_BIN="$STUB_DIR/node-trusted"
   export VERCEL_ORG_ID=org
   export VERCEL_PROJECT_ID=project
   export VERCEL_TOKEN=synthetic-secret-token
   export VERCEL_STATE_DIR="$TMP_ROOT/vercel-state"
   export VERCEL_LOG="$TMP_ROOT/vercel.log"
+  export NODE_LOG="$TMP_ROOT/node.log"
+  export PATH_NODE_MARKER="$TMP_ROOT/path-node-marker"
   export GITHUB_RUN_ID=99
   export GITHUB_RUN_ATTEMPT=1
   rm -rf "$VERCEL_STATE_DIR"
   mkdir -p "$NEUTRAL_DIR" "$VERCEL_STATE_DIR"
   : > "$GITHUB_OUTPUT"
   : > "$VERCEL_LOG"
+  : > "$NODE_LOG"
+  : > "$PATH_NODE_MARKER"
+}
+
+run_control_script() {
+  local out_file=$1
+  shift
+
+  set +e
+  (
+    cd "${CONTROL_WORKDIR:-$ROOT_DIR}"
+    env "$@" bash --noprofile --norc -e -o pipefail "$STEPS_DIR/control-plane.sh"
+  ) >"$out_file" 2>&1
+  local status=$?
+  set -e
+  return "$status"
 }
 
 test_control_plane_success_and_superseded() {
@@ -620,6 +763,60 @@ test_control_plane_success_and_superseded() {
   assert_file_not_contains "$VERCEL_LOG" "alias set https://candidate.vercel.app"
 
   pass "control plane promotes deterministically and rejects stale SHA before aliases"
+}
+
+test_build_step_starts_cli_through_preflighted_node() {
+  local out="$TMP_ROOT/build.out"
+  local workdir="$TMP_ROOT/build-workdir"
+
+  export PATH="$STUB_DIR:$PATH"
+  export GITHUB_OUTPUT="$TMP_ROOT/build-output"
+  export NODE_BIN="$STUB_DIR/node-trusted"
+  export VERCEL_BIN="$STUB_DIR/vercel-trusted"
+  export VERCEL_ORG_ID=org
+  export VERCEL_PROJECT_ID=project
+  export NODE_LOG="$TMP_ROOT/node.log"
+  export VERCEL_LOG="$TMP_ROOT/vercel.log"
+  export PATH_NODE_MARKER="$TMP_ROOT/path-node-marker"
+  export PATH_VERCEL_MARKER="$TMP_ROOT/path-vercel-marker"
+  export RUNNER_TEMP="$TMP_ROOT/build-runner-temp"
+  unset VERCEL_STUB_VERSION
+  rm -rf "$workdir"
+  mkdir -p "$workdir" "$RUNNER_TEMP"
+  : > "$NODE_LOG"
+  : > "$VERCEL_LOG"
+  : > "$PATH_NODE_MARKER"
+  : > "$PATH_VERCEL_MARKER"
+
+  # Inherited NODE_OPTIONS is a legitimate input to this step (the workflow
+  # sets a heap limit), so only PATH poisoning is asserted here: the CLI must
+  # still be started through the preflighted absolute interpreter.
+  set +e
+  (
+    cd "$workdir"
+    env bash --noprofile --norc -e -o pipefail "$STEPS_DIR/build.sh"
+  ) >"$out" 2>&1
+  local status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    cat "$out" >&2
+    fail "build step should succeed with synthetic CLI"
+  fi
+  if [ ! -f "$workdir/.vercel/output/config.json" ]; then
+    fail "build step did not run the CLI build"
+  fi
+  assert_file_contains "$VERCEL_LOG" "build"
+  if [ -s "$PATH_NODE_MARKER" ]; then
+    fail "build step invoked a PATH-resolved node"
+  fi
+  if [ -s "$PATH_VERCEL_MARKER" ]; then
+    fail "build step invoked a PATH-resolved vercel"
+  fi
+  if ! grep -Fq 'node-path=' "$NODE_LOG"; then
+    fail "build step must start the CLI through the preflighted Node interpreter"
+  fi
+
+  pass "build step starts the CLI through the preflighted absolute Node interpreter"
 }
 
 test_control_plane_failure_modes() {
@@ -647,6 +844,20 @@ test_control_plane_failure_modes() {
     fail "rollback failure should emit rollback_failed"
   fi
   assert_file_contains "$out" "Rollback alias set failed"
+  assert_file_not_contains "$out" "synthetic-secret-token"
+
+  # The CLI is a Node entrypoint. A PATH-resolved node or inherited NODE_OPTIONS
+  # must never start the token-bearing control-plane process.
+  set_control_env
+  run_control_script "$out" NODE_OPTIONS=--require=/tmp/poison-123456.js NODE_PATH=/tmp/poison-node-path
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "success" ]; then
+    fail "control step should sanitize Node startup environment and still succeed"
+  fi
+  if [ -s "$PATH_NODE_MARKER" ]; then
+    fail "token-bearing control step invoked a PATH-resolved node"
+  fi
+  assert_file_not_contains "$NODE_LOG" 'node-options=--require=/tmp/poison-123456.js'
+  assert_file_not_contains "$NODE_LOG" 'node-path=/tmp/poison-node-path'
   assert_file_not_contains "$out" "synthetic-secret-token"
 
   pass "control-plane failures roll back or incident without leaking token"
@@ -773,6 +984,68 @@ test_smoke_candidate_redirect_fails_without_following() {
   pass "candidate redirects fail closed instead of forwarding the bypass header"
 }
 
+test_smoke_ignores_default_curl_config() {
+  local out="$TMP_ROOT/smoke-curlrc.out"
+  local curl_home="$TMP_ROOT/curl-home"
+  local candidate_line
+
+  mkdir -p "$curl_home"
+  printf 'location = true\nverbose = true\n' > "$curl_home/.curlrc"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" HOME="$curl_home" \
+    CURL_SCENARIO=candidate_redirect_3xx \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+    EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "inherited .curlrc redirect is a managed smoke failure"
+
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "an inherited .curlrc with location must not turn a candidate redirect into success"
+  fi
+  candidate_line=$(grep -F 'url=https://candidate.vercel.app ' "$CURL_LOG" || true)
+  if [ -z "$candidate_line" ]; then
+    fail "candidate smoke did not issue a request"
+  fi
+  if [[ "$candidate_line" != *"defaults_disabled=yes"* ]]; then
+    fail "curl default configuration must be disabled for the candidate smoke"
+  fi
+  if [[ "$candidate_line" != *"follows_redirects=no"* ]]; then
+    fail "candidate smoke must not follow redirects even with an inherited .curlrc"
+  fi
+  if [ "$(grep -Fc 'first_arg=--disable' "$CURL_LOG")" -ne 3 ]; then
+    fail "--disable must be curl's first argument on candidate and alias smokes"
+  fi
+  assert_file_contains "$out" "Staging smoke unexpected redirect"
+  assert_file_not_contains "$CURL_LOG" "synthetic-bypass-value"
+  assert_file_not_contains "$out" "synthetic-bypass-value"
+
+  pass "curl default configuration cannot re-enable redirects or leak the bypass header"
+}
+
+test_smoke_transport_failures_are_failures() {
+  local out="$TMP_ROOT/smoke-transport.out"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=candidate_transport_fail \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+    EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "candidate transport failure is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "a candidate 200 followed by curl exit 28 must fail the smoke"
+  fi
+  assert_file_contains "$out" "Staging smoke request failed"
+  assert_file_contains "$out" "manual-recovery incident"
+  assert_file_not_contains "$out" "synthetic-bypass-value"
+
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_transport_fail \
+    VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value \
+    EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "alias transport failure is a managed smoke failure"
+  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "failed" ]; then
+    fail "an alias 200 followed by curl exit 28 must fail the smoke"
+  fi
+
+  pass "curl transport errors cannot be reported as successful smokes"
+}
+
 test_smoke_without_bypass_fails_closed() {
   local out="$TMP_ROOT/smoke-no-bypass.out"
   local curl_count
@@ -792,7 +1065,7 @@ test_smoke_without_bypass_fails_closed() {
   if grep -Fq "url=https://candidate.vercel.app " "$CURL_LOG"; then
     fail "candidate must not be smoked when the bypass secret is absent"
   fi
-  curl_count=$(wc -l < "$CURL_LOG")
+  curl_count=$(grep -c '^url=' "$CURL_LOG")
   if [ "$curl_count" -ne 2 ]; then
     echo "curl log:" >&2
     cat "$CURL_LOG" >&2 || true
@@ -905,9 +1178,12 @@ test_verify_exact_source
 test_prepare_alias_allowlist
 test_control_plane_success_and_superseded
 test_control_plane_failure_modes
+test_build_step_starts_cli_through_preflighted_node
 test_post_promotion_smoke_incident
 test_smoke_bypass_header_candidate_only
 test_smoke_candidate_redirect_fails_without_following
+test_smoke_ignores_default_curl_config
+test_smoke_transport_failures_are_failures
 test_smoke_without_bypass_fails_closed
 test_smoke_login_redirect_is_failure
 test_smoke_rejects_unsafe_bypass_value
