@@ -546,6 +546,7 @@ test_static_contract() {
   assert_file_contains "$WORKFLOW_FILE" "fetch-depth: 0"
   assert_file_contains "$WORKFLOW_FILE" "https://github.com/eba8/mission-control/issues/413"
 assert_file_contains "$WORKFLOW_FILE" "dedicated"
+  assert_file_contains "$WORKFLOW_FILE" "Root Directory setting MUST also be empty"
   assert_file_not_contains "$WORKFLOW_FILE" "upload-artifact"
   assert_file_not_contains "$WORKFLOW_FILE" "download-artifact"
   assert_file_not_contains "$WORKFLOW_FILE" "npm install -g vercel"
@@ -637,6 +638,8 @@ assert context['env']['BUILD_SOURCE_SHA'] == '${{ steps.build.outputs.source_sha
 assert control['env']['DEPLOY_DIR'] == '${{ steps.deploy_context.outputs.deploy_dir }}'
 assert control['env']['DEPLOY_SOURCE_SHA'] == '${{ steps.deploy_context.outputs.source_sha }}'
 assert build['env']['PROJECT_SETTINGS_JSON'] == '${{ inputs.project_settings }}'
+assert bypass_steps[0]['env']['PYTHON_BIN'] == '${{ steps.tools.outputs.python }}'
+assert bypass_steps[0]['env']['NEUTRAL_DIR'] == '${{ runner.temp }}'
 assert build['env']['EXPECTED_SHA'] == '${{ inputs.expected_sha }}'
 PYTHON
 
@@ -868,6 +871,92 @@ test_context_refuses_extra_files_and_cleans_up() {
   pass "context validation rejects extra files and cleanup removes only the prepared directory"
 }
 
+test_output_inventory_is_recursive() {
+  local out="$TMP_ROOT/recursive-output.out"
+  local name
+  for name in vercel.ts vercel.mts vercel.js vercel.mjs vercel.cjs vercel.json vercel.toml fifo symlink; do
+    set_control_env
+    prepare_context "$out" || fail "clean context should prepare"
+    mkdir -p "$DEPLOY_DIR/.vercel/output/functions/probe.func/nested"
+    local target="$DEPLOY_DIR/.vercel/output/functions/probe.func/nested/$name"
+    case "$name" in
+      fifo) mkfifo "$target" ;;
+      symlink) ln -s "$CONTROL_WORKDIR/.vercel/output/config.json" "$target" ;;
+      *) printf 'throw new Error("must not run")' > "$target" ;;
+    esac
+    run_prepared_control_script "$out" || fail "unsafe output must be a managed rejection"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "$name in nested output must fail closed"
+    assert_file_contains "$out" "Staging deploy context refused"
+    assert_file_not_contains "$VERCEL_LOG" "deploy"
+    run_script "$STEPS_DIR/cleanup-context.sh" "$out" || fail "context cleanup failed"
+  done
+  set_control_env
+  ln -s "$CONTROL_WORKDIR/.vercel/output/config.json" "$CONTROL_WORKDIR/.vercel/output/link"
+  prepare_context "$out" && fail "source output symlink must be rejected before copy"
+  assert_file_contains "$out" "Unsafe prebuilt output"
+  rm "$CONTROL_WORKDIR/.vercel/output/link"
+  pass "recursive output validation rejects Vercel configs, symlinks, and special files"
+}
+
+test_project_root_and_settings_modes() {
+  local out="$TMP_ROOT/settings-modes.out"
+  local workdir="$TMP_ROOT/settings-mode-source"
+  local root
+  set_control_env
+  for root in apps/web . /; do
+    rm -rf "$workdir"
+    mkdir -p "$workdir/apps/web/public"
+    (
+      cd "$workdir"
+      unset VERCEL_TOKEN
+      run_script "$STEPS_DIR/build.sh" "$out" PROJECT_SETTINGS_JSON="{\"rootDirectory\":\"$root\"}"
+    ) && fail "non-empty rootDirectory must be refused before build"
+    assert_file_contains "$out" "Unsupported Vercel root directory"
+    [ ! -e "$workdir/.vercel/project.json" ] || fail "unsupported root must not write settings"
+  done
+  rm -rf "$workdir"
+  mkdir -p "$workdir"
+  (
+    cd "$workdir"
+    unset VERCEL_TOKEN
+    umask 000
+    run_script "$STEPS_DIR/build.sh" "$out" || fail "fresh build under umask 000 should pass"
+  )
+  [ "$(/usr/bin/stat -c %a "$workdir/.vercel")" = 700 ] || fail "settings dir must be 0700 under umask 000"
+  [ "$(/usr/bin/stat -c %a "$workdir/.vercel/project.json")" = 600 ] || fail "settings file must be 0600 under umask 000"
+  chmod 0666 "$workdir/.vercel/project.json"
+  cp "$workdir/.vercel/project.json" "$TMP_ROOT/original-settings"
+  (
+    cd "$workdir"
+    unset VERCEL_TOKEN
+    umask 000
+    run_script "$STEPS_DIR/build.sh" "$out"
+  ) && fail "an existing 0666 settings file must never be reused"
+  assert_file_contains "$out" "Refusing existing Vercel project settings"
+  cmp "$workdir/.vercel/project.json" "$TMP_ROOT/original-settings" || fail "existing settings were overwritten"
+  set_control_env
+  ( umask 000; prepare_context "$out" ) || fail "minimal context should prepare under umask 000"
+  # The subprocess does not export its outputs back to this shell.
+  local deploy
+  deploy=$(read_output "$TMP_ROOT/context-output" deploy_dir)
+  [ "$(/usr/bin/stat -c %a "$deploy/.vercel")" = 700 ] || fail "deploy link dir must be 0700"
+  [ "$(/usr/bin/stat -c %a "$deploy/.vercel/project.json")" = 600 ] || fail "deploy link file must be 0600"
+  pass "non-empty roots fail early; fresh links use restrictive modes and refuse reuse"
+}
+
+test_smoke_rejects_unsafe_landings() {
+  local out="$TMP_ROOT/unsafe-landing.out"
+  local url
+  for url in 'http://app.example/ok' 'ftp://app.example/ok' 'https:///missing-host' 'https://app.example:bad/ok' 'https://app.example/%zz' 'https://app%20example/ok'; do
+    set_smoke_env
+    run_script "$STEPS_DIR/smoke.sh" "$out" CURL_SCENARIO=alias_login LOGIN_URL="$url" \
+      VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "unsafe landing must be managed"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "$url must fail closed"
+    assert_file_contains "$out" "Staging smoke unsafe landing"
+  done
+  pass "malformed URLs and non-HTTPS final landings fail closed"
+}
+
 test_build_output_is_bound_to_deploy() {
   local out="$TMP_ROOT/build-deploy.out"
   local build_output="$TMP_ROOT/build-deploy-output"
@@ -1067,6 +1156,9 @@ set_smoke_env() {
   export PATH="$STUB_DIR:$PATH"
   export GITHUB_OUTPUT="$TMP_ROOT/smoke-output"
   export CURL_BIN="$STUB_DIR/curl"
+  export PYTHON_BIN=/usr/bin/python3
+  export NEUTRAL_DIR="$TMP_ROOT/neutral"
+  mkdir -p "$NEUTRAL_DIR"
   export CURL_LOG="$TMP_ROOT/curl.log"
   export CURL_ARGV_LOG="$TMP_ROOT/curl-argv.log"
   export DEPLOYMENT_URL=https://candidate.vercel.app
@@ -1283,6 +1375,10 @@ test_smoke_login_redirect_is_failure() {
   local scenario login_url
   for login_url in \
     'https://vercel.com/login?sso=1' \
+    'https://vercel.com/%6cogin' \
+    'https://vercel.com/a/%2e%2e/%6cogin' \
+    'https://vercel.com/team/%73so' \
+    'http://vercel.com/login' \
     'https://vercel.com:443/login?sso=1' \
     'https://vercel.com./login?sso=1' \
     'https://VeRcEl.CoM.:443/login?sso=1' \
@@ -1384,6 +1480,8 @@ test_verify_exact_source
 test_prepare_alias_allowlist
 test_control_never_runs_source_config
 test_context_refuses_extra_files_and_cleans_up
+test_output_inventory_is_recursive
+test_project_root_and_settings_modes
 test_build_output_is_bound_to_deploy
 test_control_plane_success_and_superseded
 test_control_plane_failure_modes
@@ -1396,6 +1494,7 @@ test_smoke_ignores_default_curl_config
 test_smoke_transport_failures_are_failures
 test_smoke_without_bypass_fails_closed
 test_smoke_login_redirect_is_failure
+test_smoke_rejects_unsafe_landings
 test_smoke_rejects_unsafe_bypass_value
 test_finalize_result_gate
 test_shell_validation

@@ -16,11 +16,17 @@ name: Vercel Staging Deploy (reusable)
 #   keys: framework, buildCommand, installCommand, devCommand, outputDirectory,
 #   rootDirectory, nodeVersion (string or null). Example for a static site:
 #   '{"framework":null,"installCommand":"","buildCommand":null,"outputDirectory":"public"}'
+#   rootDirectory must be null/empty; monorepo roots are unsupported. The
+#   remote Vercel project's Root Directory setting MUST also be empty.
 #   Match the staging project's settings. Never include environment variables,
 #   credentials, or secret values. The tokenless build writes these settings and
 #   the non-secret org/project IDs to fresh .vercel/project.json; no pull occurs.
 #   Only .vercel/output and a regenerated ID-only link enter a fresh deploy
 #   directory. Repository sources and vercel.* configuration never enter it.
+#   Prebuilt output must recursively contain only directories and regular files,
+#   without symlinks or Vercel config files (vercel.ts/mts/js/mjs/cjs/json/toml).
+#   Project links use 0700 directories and exclusive 0600 files, even under a
+#   permissive umask. Existing project.json files are refused, never overwritten.
 # - Keep the consumer repo's staging environment secret VERCEL_TOKEN dedicated
 #   to staging, team-scoped for WebLime Vercel, and distinct from production.
 # - Own rotation/revocation and the manual recovery runbook for post-promotion
@@ -46,7 +52,7 @@ on:
         required: true
         type: string
       project_settings:
-        description: "Reviewed non-secret project settings JSON; allowed string/null keys: framework, buildCommand, installCommand, devCommand, outputDirectory, rootDirectory, nodeVersion. Never include env or credentials."
+        description: "Reviewed non-secret project settings JSON; allowed string/null keys: framework, buildCommand, installCommand, devCommand, outputDirectory, rootDirectory (null/empty only), nodeVersion. Monorepo roots unsupported. Never include env or credentials."
         required: true
         type: string
       node_version_file:
@@ -325,13 +331,22 @@ jobs:
                   raise ValueError("invalid setting type")
           except (KeyError, ValueError):
               raise SystemExit("::error title=Invalid Vercel project settings::Supply reviewed non-secret settings JSON with only the documented keys and string/null values.")
+          if settings.get("rootDirectory") not in (None, ""):
+              raise SystemExit("::error title=Unsupported Vercel root directory::rootDirectory must be null or empty; monorepo roots are unsupported.")
           source = Path(sys.argv[1])
           vercel = source / ".vercel"
-          vercel.mkdir(exist_ok=True)
-          if vercel.is_symlink() or (vercel / "project.json").is_symlink():
+          if vercel.is_symlink():
               raise SystemExit("::error::Refusing symlinked Vercel project settings.")
+          vercel.mkdir(mode=0o700, exist_ok=True)
+          vercel.chmod(0o700)
           project = {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"], "settings": settings}
-          (vercel / "project.json").write_text(json.dumps(project))
+          try:
+              fd = os.open(vercel / "project.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          except FileExistsError:
+              raise SystemExit("::error::Refusing existing Vercel project settings; a fresh project.json is required.")
+          with os.fdopen(fd, "w") as output:
+              os.fchmod(output.fileno(), 0o600)
+              json.dump(project, output)
           PYTHON
           )
           "$NODE_BIN" -- "$VERCEL_BIN" build
@@ -415,15 +430,38 @@ jobs:
           import os
           from pathlib import Path
           import shutil
+          import stat
           import sys
           import tempfile
-          # Copy only build output. Dereference symlinks so the deploy context
-          # cannot refer back to repository sources/configuration.
+          def verify_output(output):
+              pending = [output]
+              forbidden = {"vercel.ts", "vercel.mts", "vercel.js", "vercel.mjs", "vercel.cjs", "vercel.json", "vercel.toml"}
+              while pending:
+                  path = pending.pop()
+                  mode = path.lstat().st_mode
+                  if path.name.lower() in forbidden:
+                      raise SystemExit("::error title=Unsafe prebuilt output::Vercel configuration is forbidden anywhere in prebuilt output.")
+                  if stat.S_ISDIR(mode):
+                      pending.extend(path.iterdir())
+                  elif not stat.S_ISREG(mode):
+                      raise SystemExit("::error title=Unsafe prebuilt output::Symlinks and non-regular files are forbidden in prebuilt output.")
+          source_output = Path(sys.argv[1]) / ".vercel/output"
+          if source_output.parent.is_symlink():
+              raise SystemExit("::error title=Unsafe prebuilt output::Symlinked output parent refused.")
+          verify_output(source_output)
+          # Preserve any racing symlink as a symlink, then reject it. Never
+          # dereference source links while copying into the token-bearing cwd.
           deploy = Path(tempfile.mkdtemp(prefix="vercel-staging-deploy-", dir=os.getcwd()))
+          deploy.chmod(0o700)
           try:
-              shutil.copytree(Path(sys.argv[1]) / ".vercel/output", deploy / ".vercel/output")
+              shutil.copytree(source_output, deploy / ".vercel/output", symlinks=True)
+              verify_output(deploy / ".vercel/output")
+              (deploy / ".vercel").chmod(0o700)
               link = {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"]}
-              (deploy / ".vercel/project.json").write_text(json.dumps(link))
+              fd = os.open(deploy / ".vercel/project.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "w") as project_file:
+                  os.fchmod(project_file.fileno(), 0o600)
+                  json.dump(link, project_file)
               with open(os.environ["GITHUB_OUTPUT"], "a") as output:
                   output.write(f"deploy_dir={deploy}\nsource_sha={os.environ['EXPECTED_SHA']}\n")
           except BaseException:
@@ -624,6 +662,19 @@ jobs:
           import os
           from pathlib import Path
           import sys
+          import stat
+          def verify_output(output):
+              pending = [output]
+              forbidden = {"vercel.ts", "vercel.mts", "vercel.js", "vercel.mjs", "vercel.cjs", "vercel.json", "vercel.toml"}
+              while pending:
+                  path = pending.pop()
+                  mode = path.lstat().st_mode
+                  if path.name.lower() in forbidden:
+                      raise SystemExit("::error title=Unsafe prebuilt output::Vercel configuration is forbidden anywhere in prebuilt output.")
+                  if stat.S_ISDIR(mode):
+                      pending.extend(path.iterdir())
+                  elif not stat.S_ISREG(mode):
+                      raise SystemExit("::error title=Unsafe prebuilt output::Symlinks and non-regular files are forbidden in prebuilt output.")
           deploy = Path(sys.argv[1])
           if not deploy.is_absolute() or deploy.is_symlink() or deploy.parent.resolve() != Path.cwd().resolve() or not deploy.name.startswith("vercel-staging-deploy-"):
               raise SystemExit("invalid deploy directory")
@@ -631,6 +682,7 @@ jobs:
               raise SystemExit("unexpected deploy context files")
           if any(p.is_symlink() for p in deploy.rglob("*")) or not (deploy / ".vercel/output/config.json").is_file():
               raise SystemExit("invalid prebuilt output")
+          verify_output(deploy / ".vercel/output")
           link = json.loads((deploy / ".vercel/project.json").read_text())
           if link != {"orgId": os.environ["VERCEL_ORG_ID"], "projectId": os.environ["VERCEL_PROJECT_ID"]}:
               raise SystemExit("invalid project link")
@@ -691,6 +743,8 @@ jobs:
         id: smoke
         if: steps.control.outputs.result == 'success'
         env:
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          NEUTRAL_DIR: ${{ runner.temp }}
           CURL_BIN: ${{ steps.tools.outputs.curl }}
           DEPLOYMENT_URL: ${{ steps.control.outputs.deployment_url }}
           PROMOTED_ALIASES: ${{ steps.control.outputs.promoted_aliases }}
@@ -703,25 +757,38 @@ jobs:
           # Vercel Deployment Protection answers protected *.vercel.app hosts
           # with a redirect to a Vercel login/SSO page. Treat any such redirect
           # as a failed check rather than a successful smoke.
-          is_vercel_login_url() {
-            local url=${1,,}
-            local authority path
-            case "$url" in
-              https://*) url=${url#https://} ;;
-              *) return 1 ;;
-            esac
-            authority=${url%%/*}
-            authority=${authority%:443}
-            authority=${authority%.}
-            path=/${url#*/}
-            case "$authority" in
-              vercel.com|*.vercel.com) ;;
-              *) return 1 ;;
-            esac
-            case "$path" in
-              /login*|/sso*|/*/sso*) return 0 ;;
-            esac
-            return 1
+          classify_landing_url() {
+            (
+              cd "$NEUTRAL_DIR" || exit 1
+              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$1" <<'PYTHON'
+          import posixpath
+          import re
+          import sys
+          from urllib.parse import unquote, urlsplit
+          try:
+              url = sys.argv[1]
+              if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url) or re.search(r"%(?![0-9A-Fa-f]{2})", url):
+                  raise ValueError("invalid URL characters")
+              parsed = urlsplit(url)
+              host = unquote(parsed.hostname or "", errors="strict").rstrip(".").lower().encode("idna").decode("ascii")
+              port = parsed.port
+              if not host or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in host) or parsed.username is not None or any(c in host for c in "/\\?#@%") or (port is not None and not 1 <= port <= 65535):
+                  raise ValueError("invalid authority")
+              decoded = unquote(parsed.path, errors="strict")
+              if any(ord(c) < 32 or ord(c) == 127 for c in decoded) or "\\" in decoded:
+                  raise ValueError("invalid path")
+              path = posixpath.normpath("/" + decoded.lstrip("/")).lower()
+              login = (host == "vercel.com" or host.endswith(".vercel.com")) and (path.startswith("/login") or any(segment.startswith("sso") for segment in path.split("/")[1:]))
+              if login:
+                  print("login")
+              elif parsed.scheme.lower() != "https":
+                  print("unsafe")
+              else:
+                  print("https")
+          except (ValueError, UnicodeError):
+              print("unsafe")
+          PYTHON
+            )
           }
 
           # Smoke one URL. When a bypass secret is supplied, the header is fed
@@ -773,7 +840,7 @@ jobs:
             local url=$2
             local bypass_secret=${3:-}
             local follow_redirects=${4:-true}
-            local result http_code effective_url
+            local result http_code effective_url landing
 
             if [ -z "$url" ]; then
               echo "::error title=Staging smoke missing URL::$label has no URL to smoke."
@@ -792,8 +859,16 @@ jobs:
               smoke_failed=true
               return 0
             fi
-            if is_vercel_login_url "$effective_url"; then
+            if ! landing=$(classify_landing_url "$effective_url"); then
+              landing=unsafe
+            fi
+            if [ "$landing" = "login" ]; then
               echo "::error title=Staging smoke hit Vercel login::$label redirected to a Vercel login or SSO page, which is not a successful smoke."
+              smoke_failed=true
+              return 0
+            fi
+            if [ "$landing" != "https" ]; then
+              echo "::error title=Staging smoke unsafe landing::$label returned a malformed URL or a non-HTTPS final landing."
               smoke_failed=true
               return 0
             fi
