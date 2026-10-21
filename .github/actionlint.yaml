@@ -1,0 +1,10 @@
+self-hosted-runner:
+  labels:
+    - weblime-ci
+
+paths:
+  # VERCEL_TOKEN is injected by the consumer's staging GitHub Environment.
+  # workflow_call cannot declare it without changing the #20 caller contract.
+  .github/workflows/vercel-staging-reusable.yml:
+    ignore:
+      - 'property "vercel_token" is not defined'
