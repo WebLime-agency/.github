@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Single-quoted GitHub expression literals are assertions, not expansions.
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -502,6 +503,18 @@ test_preflight_vercel_cli() {
   common_preflight_env
   run_script "$script" "$out" BAD_MODE_PATH="$STUB_DIR/git" && fail "writable git should fail"
   assert_file_contains "$out" "Unsafe git permissions"
+
+  # A symlink whose target lives under a writable directory must be rejected
+  # even though the lexical path itself looks safe.
+  mkdir -p "$STUB_DIR/untrusted"
+  cp "$STUB_DIR/vercel-trusted" "$STUB_DIR/untrusted/vercel-trusted"
+  mv "$STUB_DIR/vercel-trusted" "$STUB_DIR/vercel-trusted.real"
+  ln -s "$STUB_DIR/untrusted/vercel-trusted" "$STUB_DIR/vercel-trusted"
+  common_preflight_env
+  run_script "$script" "$out" BAD_MODE_PATH="$STUB_DIR/untrusted" && fail "symlink into a writable directory should fail"
+  assert_file_contains "$out" "Unsafe vercel resolved permissions"
+  unlink "$STUB_DIR/vercel-trusted"
+  mv "$STUB_DIR/vercel-trusted.real" "$STUB_DIR/vercel-trusted"
 
   pass "A1 tool and Vercel CLI preflight fails closed"
 }

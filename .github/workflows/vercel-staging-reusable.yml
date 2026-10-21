@@ -89,24 +89,11 @@ jobs:
             exit 1
           fi
 
-          require_abs_tool() {
+          walk_tool_chain() {
             local name=$1
             local path=$2
-
-            case "$path" in
-              /*) ;;
-              *)
-                echo "::error title=Untrusted $name path::$name must resolve to an absolute path." >&2
-                exit 1
-                ;;
-            esac
-
-            if [ ! -x "$path" ]; then
-              echo "::error title=Missing trusted $name::$path is not executable." >&2
-              exit 1
-            fi
-
             local current=$path
+
             while :; do
               local metadata owner mode
               if ! metadata="$(/usr/bin/stat -Lc '%u %a' "$current" 2>/dev/null)"; then
@@ -128,6 +115,34 @@ jobs:
             done
           }
 
+          require_abs_tool() {
+            local name=$1
+            local path=$2
+
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name path::$name must resolve to an absolute path." >&2
+                exit 1
+                ;;
+            esac
+
+            if [ ! -x "$path" ]; then
+              echo "::error title=Missing trusted $name::$path is not executable." >&2
+              exit 1
+            fi
+
+            # Reject both the lexical path chain and the fully resolved chain so
+            # a symlink into a writable directory cannot smuggle in a tool.
+            walk_tool_chain "$name" "$path"
+            local resolved
+            if ! resolved="$("$READLINK_BIN" -f -- "$path" 2>/dev/null)"; then
+              echo "::error title=$name resolution failure::Unable to canonicalize $path." >&2
+              exit 1
+            fi
+            walk_tool_chain "$name resolved" "$resolved"
+          }
+
           resolve_path_tool() {
             local name=$1
             local path
@@ -145,6 +160,13 @@ jobs:
             require_abs_tool "$name" "$path"
             printf '%s\n' "$path"
           }
+
+          READLINK_BIN="/usr/bin/readlink"
+          if [ ! -x "$READLINK_BIN" ]; then
+            echo "::error title=Missing trusted readlink::$READLINK_BIN is not executable." >&2
+            exit 1
+          fi
+          walk_tool_chain "readlink" "$READLINK_BIN"
 
           require_abs_tool "stat" "/usr/bin/stat"
           require_abs_tool "sha256sum" "/usr/bin/sha256sum"
