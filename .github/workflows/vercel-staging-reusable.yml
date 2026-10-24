@@ -6,7 +6,14 @@ name: Vercel Staging Deploy (reusable)
 # runner risk, but true host isolation is still tracked by:
 # https://github.com/eba8/mission-control/issues/413
 #
+# Process-group cleanup and scrubbed environments below are defense in depth,
+# NOT an isolation boundary. Same-user code can escape a process group or read
+# same-user files/processes. P1-1 remains open, awaiting isolation decision.
 # Operator preconditions:
+# - Recommend required reviewers and a deployment-branch restriction to dev
+#   for the consumer's staging environment; the reusable does not enforce these.
+# - Private dev fetches use the caller's ephemeral contents:read GitHub token
+#   via a process-only credential helper; checkout credentials stay unpersisted.
 # - Provision /opt/weblime/vercel/56.3.1/vercel from vercel@56.3.1 dist/vc.js,
 #   root-owned, not group/world-writable, immutable where feasible.
 # - Provision the exact Node.js release named by the consumer's
@@ -97,6 +104,64 @@ jobs:
       promoted_aliases: ${{ steps.finalize.outputs.promoted_aliases }}
       result: ${{ steps.finalize.outputs.result }}
     steps:
+      - name: Validate staging inputs
+        id: inputs
+        env:
+          # Pass presence only; the bypass value remains scoped to smoke.
+          BYPASS_CONFIGURED: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET != '' }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+        run: |
+          set -euo pipefail
+          if [ "$BYPASS_CONFIGURED" != true ]; then
+            echo "::error::VERCEL_AUTOMATION_BYPASS_SECRET not configured"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid expected_sha"
+            exit 1
+          fi
+          if [[ ! "$NODE_VERSION_FILE" =~ ^[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*$ ]] || [[ "/$NODE_VERSION_FILE/" == */../* ]] || [[ "/$NODE_VERSION_FILE/" == */./* ]]; then
+            echo "::error::Invalid node_version_file"
+            exit 1
+          fi
+
+      - name: Prepare staging aliases
+        id: prep
+        env:
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          case "$GITHUB_REPOSITORY_NAME" in
+            WebLime-agency/limey-web-app)
+              ALIASES="pythonlife.org,staging.lm.fm"
+              ;;
+            *)
+              echo "::error title=Unsupported staging repository::No staging alias allowlist exists for $GITHUB_REPOSITORY_NAME."
+              exit 1
+              ;;
+          esac
+
+          IFS=',' read -r -a alias_array <<< "$ALIASES"
+          for alias in "${alias_array[@]}"; do
+            case "$alias" in
+              pythonlife.org|staging.lm.fm) ;;
+              lm.fm|www.lm.fm|limey.app|www.limey.app|production.*|www.production.*)
+                echo "::error title=Production domain refused::The staging reusable refuses to promote production alias $alias."
+                exit 1
+                ;;
+              *)
+                echo "::error title=Unreviewed staging alias::Alias $alias is not in the reviewed staging allowlist."
+                exit 1
+                ;;
+            esac
+          done
+
+          {
+            echo "aliases=$ALIASES"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Preflight trusted tools
         id: tools
         env:
@@ -194,6 +259,9 @@ jobs:
 
           require_abs_tool "stat" "/usr/bin/stat"
           require_abs_tool "sha256sum" "/usr/bin/sha256sum"
+          for tool_path in /usr/bin/env /bin/bash /usr/bin/mktemp /usr/bin/mkdir /usr/bin/rm /usr/bin/setsid; do
+            require_abs_tool "step tool" "$tool_path"
+          done
 
           GIT_BIN="$(resolve_path_tool git)"
           CURL_BIN="$(resolve_path_tool curl)"
@@ -214,6 +282,12 @@ jobs:
             )
           }
 
+          read -r ACTUAL_VERCEL_CLI_SHA256 _ < <(/usr/bin/sha256sum "$EXPECTED_VERCEL_CLI_PATH")
+          if [ "$ACTUAL_VERCEL_CLI_SHA256" != "$EXPECTED_VERCEL_CLI_SHA256" ]; then
+            echo "::error title=Vercel CLI hash mismatch::The operator-provisioned CLI hash does not match the reviewed vercel@$EXPECTED_PINNED_VERSION binary."
+            exit 1
+          fi
+
           VERCEL_VERSION_OUTPUT="$(run_vercel_cli --version 2>/dev/null || true)"
           VERCEL_VERSION_LINE=""
           while IFS= read -r version_line; do
@@ -227,12 +301,6 @@ jobs:
             exit 1
           fi
 
-          read -r ACTUAL_VERCEL_CLI_SHA256 _ < <(/usr/bin/sha256sum "$EXPECTED_VERCEL_CLI_PATH")
-          if [ "$ACTUAL_VERCEL_CLI_SHA256" != "$EXPECTED_VERCEL_CLI_SHA256" ]; then
-            echo "::error title=Vercel CLI hash mismatch::The operator-provisioned CLI hash does not match the reviewed vercel@$EXPECTED_PINNED_VERSION binary."
-            exit 1
-          fi
-
           {
             echo "git=$GIT_BIN"
             echo "curl=$CURL_BIN"
@@ -242,8 +310,30 @@ jobs:
             echo "vercel=$EXPECTED_VERCEL_CLI_PATH"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Validate reviewed project settings
+        env:
+          PROJECT_SETTINGS_JSON: ${{ inputs.project_settings }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          PYTHONSAFEPATH=1 "$PYTHON_BIN" -I -S - <<'PYTHON'
+          import json, os
+          allowed = {"framework", "buildCommand", "installCommand", "devCommand", "outputDirectory", "rootDirectory", "nodeVersion"}
+          try:
+              settings = json.loads(os.environ["PROJECT_SETTINGS_JSON"])
+              if not isinstance(settings, dict) or not settings or set(settings) - allowed:
+                  raise ValueError()
+              if any(v is not None and not isinstance(v, str) for v in settings.values()):
+                  raise ValueError()
+              if settings.get("rootDirectory") not in (None, ""):
+                  raise ValueError()
+          except (KeyError, ValueError):
+              raise SystemExit("::error::Invalid reviewed project_settings")
+          PYTHON
+
       - name: Checkout exact staging source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.expected_sha }}
           fetch-depth: 0
@@ -252,7 +342,10 @@ jobs:
           path: src-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify exact source
+        id: source
         env:
+          READ_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           GIT_BIN: ${{ steps.tools.outputs.git }}
         working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
@@ -275,8 +368,29 @@ jobs:
             exit 1
           fi
 
+          read_token=${READ_TOKEN:-}
+          unset READ_TOKEN
+          # persist-credentials:false is intentional. Use the job-scoped,
+          # contents:read GitHub token only in this fetch subprocess; disable
+          # stored helpers. Nothing is written to repository credential config.
+          # shellcheck disable=SC2016 # The credential helper expands in git, not this shell.
+          fetch_dev() {
+            READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0 "$GIT_BIN" \
+              -c credential.helper= \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$READ_TOKEN"; }; f' \
+              fetch --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY_NAME.git" \
+              '+refs/heads/dev:refs/remotes/origin/dev'
+          }
+          fetch_dev
+          ORIGIN_DEV_SHA="$("$GIT_BIN" rev-parse refs/remotes/origin/dev)"
+          if ! "$GIT_BIN" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then
+            echo "::error::expected_sha is not an ancestor of origin/dev"
+            exit 1
+          fi
+          echo "origin_dev_sha=$ORIGIN_DEV_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: src-${{ github.run_id }}-${{ github.run_attempt }}/${{ inputs.node_version_file }}
 
@@ -301,6 +415,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          build_private=$(/usr/bin/mktemp -d /tmp/vercel-staging-build-XXXXXXXX)
+          trap '/usr/bin/rm -rf -- "$build_private"' EXIT
+          /usr/bin/mkdir -m 700 "$build_private/home" "$build_private/tmp"
           missing=false
           for required_name in VERCEL_ORG_ID VERCEL_PROJECT_ID; do
             if [ -z "${!required_name:-}" ]; then
@@ -317,7 +434,7 @@ jobs:
           SOURCE_DIR=$PWD
           (
             cd "$NEUTRAL_DIR"
-            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
+            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$build_private/home" "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
           import json
           import os
           from pathlib import Path
@@ -349,7 +466,55 @@ jobs:
               json.dump(project, output)
           PYTHON
           )
-          "$NODE_BIN" -- "$VERCEL_BIN" build
+          (
+            cd "$NEUTRAL_DIR"
+            /usr/bin/env -i \
+              PATH=/usr/bin:/bin HOME="$build_private/home" TMPDIR="$build_private/tmp" \
+              CI=1 NO_UPDATE_NOTIFIER=1 VERCEL_TELEMETRY_DISABLED=1 \
+              NODE_OPTIONS=--max-old-space-size=4096 \
+              EXPECTED_SHA="$EXPECTED_SHA" \
+              VERCEL_ORG_ID="$VERCEL_ORG_ID" VERCEL_PROJECT_ID="$VERCEL_PROJECT_ID" \
+              PUBLIC_SUPABASE_URL="${PUBLIC_SUPABASE_URL:-}" \
+              PUBLIC_SUPABASE_ANON_KEY="${PUBLIC_SUPABASE_ANON_KEY:-}" \
+              PUBLIC_SITE_URL="${PUBLIC_SITE_URL:-}" PUBLIC_APP_ENV="${PUBLIC_APP_ENV:-}" \
+              PUBLIC_TURNSTILE_SITE_KEY="${PUBLIC_TURNSTILE_SITE_KEY:-}" \
+              "$PYTHON_BIN" -I -S - "$SOURCE_DIR" "$NODE_BIN" "$VERCEL_BIN" <<'SUPERVISOR'
+          import ctypes
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          # Reap orphaned descendants in this group as well as the CLI itself.
+          # This is cleanup, not containment: children can escape via setsid.
+          if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+              raise SystemExit("::error::Cannot supervise build descendants")
+          child = subprocess.Popen(["/usr/bin/setsid", "--", sys.argv[2], "--", sys.argv[3], "build"], cwd=sys.argv[1])
+          status = 1
+          try:
+              status = child.wait()
+          finally:
+              try:
+                  os.killpg(child.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              # Bounded reaping; a surviving group fails closed before control.
+              for attempt in range(100):
+                  try:
+                      while os.waitpid(-child.pid, os.WNOHANG)[0]:
+                          pass
+                  except ChildProcessError:
+                      pass
+                  try:
+                      os.killpg(child.pid, 0)
+                  except ProcessLookupError:
+                      break
+                  time.sleep(0.02)
+              else:
+                  raise SystemExit("::error::Build process group survived cleanup")
+          raise SystemExit(status if status >= 0 else 1)
+          SUPERVISOR
+          )
 
           if [ ! -d .vercel/output ] || [ ! -f .vercel/output/config.json ]; then
             echo "::error title=Missing Vercel output::vercel build did not create .vercel/output/config.json."
@@ -360,48 +525,6 @@ jobs:
           {
             echo "source_dir=$PWD"
             echo "source_sha=$EXPECTED_SHA"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Prepare staging aliases
-        id: prep
-        env:
-          GIT_BIN: ${{ steps.tools.outputs.git }}
-          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
-        working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-
-          "$GIT_BIN" fetch --quiet origin dev
-          ORIGIN_DEV_SHA="$("$GIT_BIN" rev-parse refs/remotes/origin/dev)"
-
-          case "$GITHUB_REPOSITORY_NAME" in
-            WebLime-agency/limey-web-app)
-              ALIASES="pythonlife.org,staging.lm.fm"
-              ;;
-            *)
-              echo "::error title=Unsupported staging repository::No staging alias allowlist exists for $GITHUB_REPOSITORY_NAME."
-              exit 1
-              ;;
-          esac
-
-          IFS=',' read -r -a alias_array <<< "$ALIASES"
-          for alias in "${alias_array[@]}"; do
-            case "$alias" in
-              pythonlife.org|staging.lm.fm) ;;
-              lm.fm|www.lm.fm|limey.app|www.limey.app|production.*|www.production.*)
-                echo "::error title=Production domain refused::The staging reusable refuses to promote production alias $alias."
-                exit 1
-                ;;
-              *)
-                echo "::error title=Unreviewed staging alias::Alias $alias is not in the reviewed staging allowlist."
-                exit 1
-                ;;
-            esac
-          done
-
-          {
-            echo "origin_dev_sha=$ORIGIN_DEV_SHA"
-            echo "aliases=$ALIASES"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare staging deploy context
@@ -476,7 +599,10 @@ jobs:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           DEPLOY_DIR: ${{ steps.deploy_context.outputs.deploy_dir }}
           DEPLOY_SOURCE_SHA: ${{ steps.deploy_context.outputs.source_sha }}
-          ORIGIN_DEV_SHA: ${{ steps.prep.outputs.origin_dev_sha }}
+          ORIGIN_DEV_SHA: ${{ steps.source.outputs.origin_dev_sha }}
+          READ_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+          GIT_BIN: ${{ steps.tools.outputs.git }}
           STAGING_ALIASES: ${{ steps.prep.outputs.aliases }}
           NEUTRAL_DIR: ${{ runner.temp }}
           JQ_BIN: ${{ steps.tools.outputs.jq }}
@@ -487,24 +613,69 @@ jobs:
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         working-directory: ${{ runner.temp }}
+        shell: /bin/bash --noprofile --norc -p -e -o pipefail {0}
         run: |
           set -euo pipefail
+
+          # Defense in depth only: reject inherited startup/configuration
+          # injection before creating children, then discard inherited env.
+          while IFS= read -r inherited_name; do
+            case "$inherited_name" in
+              BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|PYTHONPATH|PYTHONSTARTUP|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|NODE_TLS_REJECT_UNAUTHORIZED|GIT_CONFIG*|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|GIT_SSH*|GIT_ASKPASS|GIT_PROXY_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROTOCOL*|GIT_ATTR*|GIT_OBJECT*|GIT_ALTERNATE*|GIT_COMMON_DIR|GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CEILING_DIRECTORIES)
+                echo "::error::Unsafe inherited environment: $inherited_name"
+                exit 1
+                ;;
+            esac
+          done < <(compgen -e)
+          control_secret=${VERCEL_TOKEN:-}
+          fetch_secret=${READ_TOKEN:-}
+          unset VERCEL_TOKEN READ_TOKEN
+          private_root=$(/usr/bin/mktemp -d /tmp/vercel-staging-step-XXXXXXXX)
+          trap '/usr/bin/rm -rf -- "$private_root"' EXIT
+          /usr/bin/mkdir -m 700 "$private_root/home" "$private_root/tmp"
+          # Secrets travel on private descriptors, never env(1) argv.
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin HOME="$private_root/home" TMPDIR="$private_root/tmp" \
+            CI=1 NO_UPDATE_NOTIFIER=1 VERCEL_TELEMETRY_DISABLED=1 \
+            EXPECTED_SHA="${EXPECTED_SHA:-}" \
+            DEPLOY_DIR="${DEPLOY_DIR:-}" \
+            DEPLOY_SOURCE_SHA="${DEPLOY_SOURCE_SHA:-}" \
+            ORIGIN_DEV_SHA="${ORIGIN_DEV_SHA:-}" \
+            STAGING_ALIASES="${STAGING_ALIASES:-}" \
+            NEUTRAL_DIR="${NEUTRAL_DIR:-}" \
+            JQ_BIN="${JQ_BIN:-}" \
+            PYTHON_BIN="${PYTHON_BIN:-}" \
+            NODE_BIN="${NODE_BIN:-}" \
+            VERCEL_BIN="${VERCEL_BIN:-}" \
+            VERCEL_ORG_ID="${VERCEL_ORG_ID:-}" \
+            VERCEL_PROJECT_ID="${VERCEL_PROJECT_ID:-}" \
+            GIT_BIN="${GIT_BIN:-}" \
+            GITHUB_REPOSITORY_NAME="${GITHUB_REPOSITORY_NAME:-}" \
+            GITHUB_OUTPUT="${GITHUB_OUTPUT:-}" \
+            GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
+            GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}" \
+            /bin/bash --noprofile --norc -e -o pipefail 3< <(printf '%s\0' "$control_secret") 4< <(printf '%s\0' "$fetch_secret") <<'CONTROL'
 
           # Sanitize the process environment so the Node CLI cannot be started
           # with PATH-resolved node or injected Node options in this
           # token-bearing step.
+          IFS= read -r -d '' control_token <&3 || true
+          IFS= read -r -d '' read_token <&4 || true
+          exec 3<&- 4<&-
           unset NODE_OPTIONS NODE_PATH
           export NODE_NO_WARNINGS=1
 
           run_vercel() {
             (
               cd "${NEUTRAL_DIR}" || exit 1
-              NODE_OPTIONS='' NODE_PATH='' HOME="$NEUTRAL_DIR" "$NODE_BIN" -- "$VERCEL_BIN" "$@" --cwd "$DEPLOY_DIR"
+              VERCEL_TOKEN="$control_token" NODE_OPTIONS='' NODE_PATH='' HOME="$HOME" "$NODE_BIN" -- "$VERCEL_BIN" "$@" --cwd "$DEPLOY_DIR"
             )
           }
 
           promoted_aliases=()
           rollback_prefix="${NEUTRAL_DIR}/vercel-staging-rollback-${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
+
+          trap 'for file in "$rollback_prefix"-*.target; do [ ! -f "$file" ] || /usr/bin/rm -f -- "$file"; done' EXIT
 
           write_output() {
             local key=$1
@@ -527,7 +698,7 @@ jobs:
           run_python() {
             (
               cd "$NEUTRAL_DIR" || exit 1
-              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$@"
+              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$HOME" "$PYTHON_BIN" -I -S - "$@"
             )
           }
 
@@ -553,19 +724,21 @@ jobs:
           }
 
           extract_target_url() {
+            # Only explicit deployment fields are anchors. Never search aliases
+            # or arbitrary nested strings. Reject conflicting schema variants.
             "$JQ_BIN" -er '
-              def walk_strings:
-                if type == "string" then .
-                elif type == "array" then .[] | walk_strings
-                elif type == "object" then .[] | walk_strings
-                else empty end;
-              [walk_strings | select(test("(^https://|^)[A-Za-z0-9.-]+\\.vercel\\.app(/)?$"))][0] // empty
+              if type != "object" then empty else
+                [.url?, .deployment.url?] | map(select(. != null)) | unique |
+                if length == 1 and (.[0] | type == "string") and
+                   (.[0] | test("^(https://)?[a-z0-9.-]+\\.vercel\\.app/?$"))
+                then .[0] else empty end
+              end
             '
           }
 
           inspect_json() {
             local target=$1
-            run_vercel inspect "$target" --wait --token="$VERCEL_TOKEN" --json
+            run_vercel inspect "$target" --wait --json
           }
 
           verify_ready() {
@@ -624,7 +797,7 @@ jobs:
                 continue
               fi
               IFS= read -r target < "$rollback_prefix-$alias.target"
-              if ! run_vercel alias set "$target" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+              if ! run_vercel alias set "$target" "$alias" >/dev/null; then
                 echo "::error title=Rollback alias set failed::Failed to restore $alias."
                 rollback_failed=true
                 continue
@@ -644,7 +817,7 @@ jobs:
             return 0
           }
 
-          if [ -z "${VERCEL_TOKEN:-}" ]; then
+          if [ -z "$control_token" ]; then
             echo "::error title=Missing staging Vercel token::Configure VERCEL_TOKEN in the consumer repository staging environment."
             set_result "failed"
             exit 0
@@ -692,7 +865,7 @@ jobs:
             set_result "failed"
             exit 0
           fi
-          if ! deploy_output="$(run_vercel deploy --prebuilt --token="$VERCEL_TOKEN")"; then
+          if ! deploy_output="$(run_vercel deploy --prebuilt)"; then
             echo "::error title=Staging prebuilt deploy failed::Unable to deploy the verified build output."
             set_result "failed"
             exit 0
@@ -718,13 +891,43 @@ jobs:
             printf '%s\n' "$previous_target" > "$rollback_prefix-$alias.target"
           done
 
+          # persist-credentials:false is intentional. Use the job-scoped,
+          # contents:read GitHub token only in this fetch subprocess; disable
+          # stored helpers. Nothing is written to repository credential config.
+          # shellcheck disable=SC2016 # The credential helper expands in git, not this shell.
+          fetch_dev() {
+            READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0 "$GIT_BIN" \
+              -c credential.helper= \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$READ_TOKEN"; }; f' \
+              fetch --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY_NAME.git" \
+              '+refs/heads/dev:refs/remotes/origin/dev'
+          }
+          # Fresh bare state, not the build's writable checkout/.git.
+          if ! "$GIT_BIN" init --bare --quiet "$TMPDIR/dev-check.git"; then
+            set_result failed
+            exit 0
+          fi
+          if ! (
+            cd "$TMPDIR/dev-check.git"
+            fetch_dev
+          ); then
+            echo "::error::Unable to refresh origin/dev"
+            set_result failed
+            exit 0
+          fi
+          ORIGIN_DEV_SHA="$("$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" rev-parse refs/remotes/origin/dev)"
+          if ! "$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then
+            echo "::error::expected_sha is not an ancestor of origin/dev"
+            set_result failed
+            exit 0
+          fi
           if [ "$EXPECTED_SHA" != "$ORIGIN_DEV_SHA" ]; then
             set_result "superseded"
             exit 0
           fi
 
           for alias in "${aliases_array[@]}"; do
-            if ! run_vercel alias set "$deployment_url" "$alias" --token="$VERCEL_TOKEN" >/dev/null; then
+            if ! run_vercel alias set "$deployment_url" "$alias" >/dev/null; then
               echo "::error title=Staging alias promotion failed::Failed to point $alias at the candidate deployment; attempting rollback."
               rollback_aliases || true
               exit 0
@@ -739,6 +942,8 @@ jobs:
 
           set_result "success"
 
+          CONTROL
+
       - name: Smoke staging candidate and aliases
         id: smoke
         if: steps.control.outputs.result == 'success'
@@ -749,9 +954,46 @@ jobs:
           DEPLOYMENT_URL: ${{ steps.control.outputs.deployment_url }}
           PROMOTED_ALIASES: ${{ steps.control.outputs.promoted_aliases }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        shell: /bin/bash --noprofile --norc -p -e -o pipefail {0}
         run: |
           set -euo pipefail
 
+          # Defense in depth only: reject inherited startup/configuration
+          # injection before creating children, then discard inherited env.
+          while IFS= read -r inherited_name; do
+            case "$inherited_name" in
+              BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|PYTHONPATH|PYTHONSTARTUP|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|NODE_TLS_REJECT_UNAUTHORIZED|GIT_CONFIG*|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|GIT_SSH*|GIT_ASKPASS|GIT_PROXY_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROTOCOL*|GIT_ATTR*|GIT_OBJECT*|GIT_ALTERNATE*|GIT_COMMON_DIR|GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CEILING_DIRECTORIES)
+                echo "::error::Unsafe inherited environment: $inherited_name"
+                exit 1
+                ;;
+            esac
+          done < <(compgen -e)
+          smoke_secret=${VERCEL_AUTOMATION_BYPASS_SECRET:-}
+          unset VERCEL_AUTOMATION_BYPASS_SECRET
+          private_root=$(/usr/bin/mktemp -d /tmp/vercel-staging-step-XXXXXXXX)
+          trap '/usr/bin/rm -rf -- "$private_root"' EXIT
+          /usr/bin/mkdir -m 700 "$private_root/home" "$private_root/tmp"
+          # Secrets travel on private descriptors, never env(1) argv.
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin HOME="$private_root/home" TMPDIR="$private_root/tmp" \
+            CI=1 NO_UPDATE_NOTIFIER=1 VERCEL_TELEMETRY_DISABLED=1 \
+            PYTHON_BIN="${PYTHON_BIN:-}" \
+            NEUTRAL_DIR="${NEUTRAL_DIR:-}" \
+            CURL_BIN="${CURL_BIN:-}" \
+            DEPLOYMENT_URL="${DEPLOYMENT_URL:-}" \
+            PROMOTED_ALIASES="${PROMOTED_ALIASES:-}" \
+            GITHUB_OUTPUT="${GITHUB_OUTPUT:-}" \
+            /bin/bash --noprofile --norc -e -o pipefail 3< <(printf '%s\0' "$smoke_secret") <<'SMOKE'
+          IFS= read -r -d '' VERCEL_AUTOMATION_BYPASS_SECRET <&3 || true
+          exec 3<&-
+
+          # Validate before constructing any bypass-bearing request. Candidate
+          # URLs must be deployment hosts, without ports, paths or userinfo.
+          if [[ ! "$DEPLOYMENT_URL" =~ ^https://[a-z0-9-]+\.vercel\.app/?$ ]]; then
+            echo "::error::Invalid candidate deployment host"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           smoke_failed=false
 
           # Vercel Deployment Protection answers protected *.vercel.app hosts
@@ -760,7 +1002,7 @@ jobs:
           classify_landing_url() {
             (
               cd "$NEUTRAL_DIR" || exit 1
-              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$1" <<'PYTHON'
+              PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$HOME" "$PYTHON_BIN" -I -S - "$1" <<'PYTHON'
           import posixpath
           import re
           import sys
@@ -928,18 +1170,27 @@ jobs:
 
           echo "result=success" >> "$GITHUB_OUTPUT"
 
+          SMOKE
+
       - name: Finalize staging result
         id: finalize
         if: always()
         env:
           CONTROL_RESULT: ${{ steps.control.outputs.result }}
           SMOKE_RESULT: ${{ steps.smoke.outputs.result }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
           DEPLOYMENT_URL: ${{ steps.control.outputs.deployment_url }}
           PROMOTED_ALIASES: ${{ steps.control.outputs.promoted_aliases }}
         run: |
           set -euo pipefail
 
-          RESULT="${SMOKE_RESULT:-$CONTROL_RESULT}"
+          RESULT="${CONTROL_RESULT:-failed}"
+          if [ "$RESULT" = success ]; then
+            RESULT=failed
+            if [ "${SMOKE_OUTCOME:-}" = success ] && [ "${SMOKE_RESULT:-}" = success ]; then
+              RESULT=success
+            fi
+          fi
           if [ -z "$RESULT" ]; then
             RESULT="failed"
           fi

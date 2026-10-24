@@ -111,6 +111,7 @@ for ((i=0; i<${#args[@]}; i++)); do
   if [ "${args[$i]}" = --cwd ]; then selected_cwd=${args[$((i+1))]}; fi
 done
 printf '%s\\n' "$selected_cwd" >> "$OFFLINE_CWD_LOG"
+[ -n "${OFFLINE_PROJECT_ROOT:-}" ] || unset OFFLINE_PROJECT_ROOT
 exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 --non-interactive
 ''')
     node.chmod(0o755)
@@ -142,7 +143,15 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
     scripts = {}
     for key in ('build', 'deploy_context', 'control', 'Clean staging deploy context', 'smoke'):
         script = root / (key.replace(' ', '-') + '.sh')
-        script.write_text(steps[key]['run'])
+        # Test-only transport hooks are added to extracted copies. The deployed
+        # workflow has no hook variables in its environment allowlist.
+        fixture_keys = ('OFFLINE_GUARD', 'OFFLINE_NETWORK_LOG', 'OFFLINE_CWD_LOG',
+                        'OFFLINE_PROJECT_ROOT', 'OFFLINE_LANDING', 'CONFIG_MARKER')
+        script_text = steps[key]['run']
+        # Only extracted fixtures retain the offline transport hooks.
+        fixture_env = ''.join(f'  {k}="${{{k}:-}}" \\\n' for k in fixture_keys)
+        script_text = script_text.replace('/usr/bin/env -i \\\n', '/usr/bin/env -i \\\n' + fixture_env)
+        script.write_text(script_text)
         scripts[key] = script
 
     def step(key, cwd, extra=None):
@@ -195,7 +204,7 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
         token = {'VERCEL_TOKEN': 'syntheticOfflineToken', 'CONFIG_MARKER': str(marker)}
         # Positive control proves the actual pinned compiler reaches this marker
         # before its network attempt. The protected workflow must exclude it.
-        direct = run([str(node), '--', str(cli), 'deploy', '--prebuilt', '--cwd', str(source), '--token=syntheticOfflineToken'], neutral, token)
+        direct = run([str(node), '--', str(cli), 'deploy', '--prebuilt', '--cwd', str(source)], neutral, token)
         require(marker.exists() and marker.read_text() == 'token-readable', 'positive control failed: real config dispatch did not execute ' + ext, direct)
         marker.unlink()
         context, output = step('deploy_context', source)
@@ -231,7 +240,7 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
     hostile = {'OFFLINE_PROJECT_ROOT':'.vercel/output', 'VERCEL_TOKEN':'syntheticOfflineToken', 'CONFIG_MARKER':str(marker)}
     artifact_config = deploy / '.vercel/output/vercel.cjs'
     artifact_config.write_text("if(process.env.VERCEL_TOKEN) process.getBuiltinModule('fs').writeFileSync(process.env.CONFIG_MARKER,'token-readable'); module.exports={};")
-    direct = run([str(node), '--', str(cli), 'deploy', '--prebuilt', '--cwd', str(deploy), '--token=syntheticOfflineToken'], neutral, hostile)
+    direct = run([str(node), '--', str(cli), 'deploy', '--prebuilt', '--cwd', str(deploy)], neutral, hostile)
     require(marker.exists() and marker.read_text() == 'token-readable', 'positive control did not reach remote-root config compilation', direct)
     marker.unlink()
     # Remove the positive compiler's cache BEFORE testing the workflow. A

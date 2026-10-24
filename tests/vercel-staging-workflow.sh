@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-WORKFLOW_FILE="$ROOT_DIR/.github/workflows/vercel-staging-reusable.yml"
-TMP_ROOT=${TMPDIR:-/tmp}/vercel-staging-workflow-test.$$
+WORKFLOW_FILE=${WORKFLOW_FILE:-"$ROOT_DIR/.github/workflows/vercel-staging-reusable.yml"}
+TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/vercel-staging-workflow-test.XXXXXXXX")
 STEPS_DIR="$TMP_ROOT/steps"
 STUB_DIR="$TMP_ROOT/bin"
 export STUB_DIR
@@ -12,6 +12,15 @@ export STUB_DIR
 pass_count=0
 
 cleanup() {
+  # Mutants may deliberately disable daemon cleanup. Reap our synthetic sleep
+  # fixture rather than leaving it alive until the surrounding test exits.
+  if [[ "${BUILD_DAEMON_PID:-}" == "$TMP_ROOT/"* ]] && [ -s "$BUILD_DAEMON_PID" ]; then
+    local fixture_pid
+    read -r fixture_pid < "$BUILD_DAEMON_PID" || true
+    if [[ "$fixture_pid" =~ ^[0-9]+$ ]]; then
+      kill "$fixture_pid" 2>/dev/null || true
+    fi
+  fi
   if [ "${KEEP_TMP:-0}" = "1" ]; then
     echo "keeping $TMP_ROOT" >&2
   else
@@ -129,6 +138,15 @@ extract_steps() {
   extract_step "Vercel control-plane deploy/promote" "$STEPS_DIR/control-plane.sh"
   extract_step "Smoke staging candidate and aliases" "$STEPS_DIR/smoke.sh"
   extract_step "Finalize staging result" "$STEPS_DIR/finalize.sh"
+  /usr/bin/python3 - "$STEPS_DIR" <<'FIXTURES'
+from pathlib import Path
+import sys
+keys = 'FIXTURE_FETCH_LOG ARGV_LOG NODE_LOG VERCEL_LOG VERCEL_STATE_DIR VERCEL_MODE FAIL_SECOND_ALIAS ROLLBACK_FAIL CONFIG_MARKER BUILD_DAEMON_PID CURL_LOG CURL_ARGV_LOG CURL_SCENARIO EXPECTED_BYPASS_SECRET LOGIN_URL STUB_CANDIDATE_URL FIXTURE_NOT_ANCESTOR FIXTURE_DEV_MOVED FIXTURE_GIT_ORIGIN_DEV_SHA'.split()
+for name in ('control-plane.sh','smoke.sh','build.sh'):
+    p=Path(sys.argv[1])/name
+    s=p.read_text().replace('/usr/bin/env -i \\\n', '/usr/bin/env -i \\\n' + ''.join('  '+k+'="${'+k+':-}" \\\n' for k in keys))
+    p.write_text(s)
+FIXTURES
 }
 
 materialize_preflight() {
@@ -226,17 +244,39 @@ STUB
   cat > "$STUB_DIR/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+credential_reset=no
+credential_helper=no
+# Accept only the workflow's explicit credential-helper and bare-dir options.
+while [[ "${1:-}" == --git-dir=* ]] || [ "${1:-}" = -c ]; do
+  if [ "$1" = -c ]; then
+    [ "$2" != credential.helper= ] || credential_reset=yes
+    [[ "$2" != 'credential.helper=!f()'* ]] || credential_helper=yes
+    shift 2
+  else shift; fi
+done
 case "$1" in
+  init) exit 0 ;;
+  merge-base) [ "${FIXTURE_NOT_ANCESTOR:-0}" != 1 ]; exit $? ;;
   fetch)
+    if [ -n "${FIXTURE_FETCH_LOG:-}" ]; then
+      [ "${READ_TOKEN:-}" = synthetic-read-token ] || exit 31
+      [ "$credential_reset" = yes ] && [ "$credential_helper" = yes ] || exit 32
+      [[ "$*" == *'https://github.com/WebLime-agency/limey-web-app.git'* ]] || exit 33
+      echo authenticated-fetch >> "$FIXTURE_FETCH_LOG"
+    fi
     exit 0
     ;;
   rev-parse)
     case "$2" in
       HEAD)
-        echo "${GIT_HEAD_SHA:-1111111111111111111111111111111111111111}"
+        echo "${FIXTURE_GIT_HEAD_SHA:-1111111111111111111111111111111111111111}"
         ;;
       refs/remotes/origin/dev)
-        echo "${GIT_ORIGIN_DEV_SHA:-1111111111111111111111111111111111111111}"
+        if [ "${FIXTURE_DEV_MOVED:-0}" = 1 ]; then
+          echo 2222222222222222222222222222222222222222
+        else
+          echo "${FIXTURE_GIT_ORIGIN_DEV_SHA:-1111111111111111111111111111111111111111}"
+        fi
         ;;
       *)
         echo "unexpected rev-parse target: $2" >&2
@@ -245,7 +285,7 @@ case "$1" in
     esac
     ;;
   status)
-    printf '%s' "${GIT_STATUS_OUTPUT:-}"
+    printf '%s' "${FIXTURE_GIT_STATUS_OUTPUT:-}"
     ;;
   *)
     echo "unexpected git invocation: $*" >&2
@@ -318,6 +358,7 @@ fi
 
 printf 'url=%s bypass_header=%s bypass_value=%s env_has_secret=%s follows_redirects=%s defaults_disabled=%s default_config_used=%s\n' \
   "$url" "$bypass_header" "$bypass_value" "$env_has_secret" "$follows_redirects" "$defaults_disabled" "$default_config_used" >> "${CURL_LOG:?}"
+printf 'home=%s tmp=%s path=%s sentinel=%s\n' "${HOME:-}" "${TMPDIR:-}" "${PATH:-}" "${UNREVIEWED_SENTINEL:-}" >> "${CURL_LOG:?}"
 printf 'first_arg=%s\n' "${args[0]:-}" >> "${CURL_LOG:?}"
 for arg in "${args[@]}"; do
   printf '%s\n' "$arg" >> "${CURL_ARGV_LOG:?}"
@@ -404,6 +445,10 @@ function aliasFile(alias) {
 
 const argv = process.argv.slice(2);
 const command = argv[0];
+if (process.env.ARGV_LOG) {
+  fs.appendFileSync(process.env.ARGV_LOG, JSON.stringify({argv, token:process.env.VERCEL_TOKEN || '', home:process.env.HOME, tmp:process.env.TMPDIR, path:process.env.PATH, sentinel:process.env.UNREVIEWED_SENTINEL || ''}) + '\n');
+}
+
 
 if (command === '--version') {
   process.stdout.write((process.env.VERCEL_STUB_VERSION || '56.3.1') + '\n');
@@ -422,6 +467,11 @@ switch (command) {
     fs.mkdirSync(path.join('.vercel', 'output'), { recursive: true });
     fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), JSON.stringify({ version: 3, fixture: 'fresh-' + process.env.EXPECTED_SHA }) + '\n');
     log('build');
+    if (process.env.BUILD_DAEMON_PID) {
+      const child=require('child_process').spawn('/bin/sleep',['300'],{stdio:'ignore'});
+      fs.writeFileSync(process.env.BUILD_DAEMON_PID,String(child.pid)+'\n');
+      child.unref();
+    }
     break;
   case 'deploy': {
     const cwdIndex = argv.indexOf('--cwd');
@@ -470,7 +520,7 @@ switch (command) {
         fs.writeFileSync(file, 'https://old-' + alias + '.vercel.app\n');
       }
       const current = fs.readFileSync(file, 'utf8').split('\n')[0];
-      process.stdout.write(JSON.stringify({ readyState: 'READY', target: current }) + '\n');
+      process.stdout.write(JSON.stringify((mode === 'alias_only' ? {alias:'moving.vercel.app'} : mode === 'ambiguous_anchor' ? {url:current, deployment:{url:'different.vercel.app'}} : {alias:'moving.vercel.app', readyState:'READY', url:current})) + '\n');
       break;
     }
     process.stdout.write(JSON.stringify({ readyState: 'READY', target }) + '\n');
@@ -512,7 +562,7 @@ run_script() {
   shift 2
 
   set +e
-  ( env "$@" bash --noprofile --norc -e -o pipefail "$script" ) >"$out_file" 2>&1
+  ( env "$@" /bin/bash --noprofile --norc -p -e -o pipefail "$script" ) >"$out_file" 2>&1
   local status=$?
   set -e
   return "$status"
@@ -605,7 +655,7 @@ assert_file_contains "$WORKFLOW_FILE" "dedicated"
   if ! grep -Fq '"$NODE_BIN" -- "$VERCEL_BIN"' "$STEPS_DIR/control-plane.sh"; then
     fail "the token-bearing control step must start the CLI through the preflighted node"
   fi
-  if ! grep -Fq '"$NODE_BIN" -- "$VERCEL_BIN" build' "$STEPS_DIR/build.sh"; then
+  if ! grep -Fq 'sys.argv[3], "build"'  "$STEPS_DIR/build.sh"; then
     fail "the build step must start the CLI through the preflighted node"
   fi
   if ! grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET not configured" "$TMP_ROOT/smoke-block.yml"; then
@@ -720,12 +770,12 @@ test_verify_exact_source() {
   export GITHUB_OUTPUT="$TMP_ROOT/verify-output"
   export GIT_BIN="$STUB_DIR/git"
   export EXPECTED_SHA=1111111111111111111111111111111111111111
-  run_script "$STEPS_DIR/verify-source.sh" "$out" GIT_HEAD_SHA=$EXPECTED_SHA GIT_STATUS_OUTPUT= || fail "matching SHA should pass"
+  run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_GIT_HEAD_SHA=$EXPECTED_SHA FIXTURE_GIT_STATUS_OUTPUT= || fail "matching SHA should pass"
 
-  run_script "$STEPS_DIR/verify-source.sh" "$out" GIT_HEAD_SHA=2222222222222222222222222222222222222222 GIT_STATUS_OUTPUT= && fail "mismatched SHA should fail"
+  run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_GIT_HEAD_SHA=2222222222222222222222222222222222222222 FIXTURE_GIT_STATUS_OUTPUT= && fail "mismatched SHA should fail"
   assert_file_contains "$out" "Unexpected checkout SHA"
 
-  run_script "$STEPS_DIR/verify-source.sh" "$out" GIT_HEAD_SHA=$EXPECTED_SHA GIT_STATUS_OUTPUT="?? stale.txt" && fail "dirty checkout should fail"
+  run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_GIT_HEAD_SHA=$EXPECTED_SHA FIXTURE_GIT_STATUS_OUTPUT="?? stale.txt" && fail "dirty checkout should fail"
   assert_file_contains "$out" "Dirty checkout"
 
   pass "A2 exact-source binding rejects mismatched or dirty checkouts"
@@ -739,18 +789,18 @@ test_prepare_alias_allowlist() {
   export GITHUB_OUTPUT="$output"
   export GIT_BIN="$STUB_DIR/git"
   : > "$GITHUB_OUTPUT"
-  run_script "$STEPS_DIR/prepare-aliases.sh" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app GIT_ORIGIN_DEV_SHA=abc || fail "limey allowlist should pass"
+  run_script "$STEPS_DIR/prepare-aliases.sh" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app FIXTURE_GIT_ORIGIN_DEV_SHA=abc || fail "limey allowlist should pass"
   if [ "$(read_output "$GITHUB_OUTPUT" aliases)" != "pythonlife.org,staging.lm.fm" ]; then
     fail "limey allowlist was not deterministic and fixed"
   fi
 
   : > "$GITHUB_OUTPUT"
-  run_script "$STEPS_DIR/prepare-aliases.sh" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/unknown GIT_ORIGIN_DEV_SHA=abc && fail "unknown repository should fail"
+  run_script "$STEPS_DIR/prepare-aliases.sh" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/unknown FIXTURE_GIT_ORIGIN_DEV_SHA=abc && fail "unknown repository should fail"
   assert_file_contains "$out" "Unsupported staging repository"
 
   materialize_production_alias_prepare "$prod_script"
   : > "$GITHUB_OUTPUT"
-  run_script "$prod_script" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app GIT_ORIGIN_DEV_SHA=abc && fail "production alias should fail"
+  run_script "$prod_script" "$out" GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app FIXTURE_GIT_ORIGIN_DEV_SHA=abc && fail "production alias should fail"
   assert_file_contains "$out" "Production domain refused"
 
   pass "staging aliases are fail-closed and per-repository"
@@ -767,6 +817,7 @@ set_control_env() {
   export BUILD_SOURCE_DIR="$CONTROL_WORKDIR"
   export BUILD_SOURCE_SHA="$EXPECTED_SHA"
   export GIT_BIN="$STUB_DIR/git"
+  export GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app READ_TOKEN=synthetic-read-token
   export JQ_BIN=/usr/bin/jq
   export PYTHON_BIN=/usr/bin/python3
   export PROJECT_SETTINGS_JSON='{"framework":null,"installCommand":"","outputDirectory":"public"}'
@@ -810,7 +861,7 @@ run_prepared_control_script() {
   set +e
   (
     cd "$NEUTRAL_DIR"
-    env "$@" bash --noprofile --norc -e -o pipefail "$STEPS_DIR/control-plane.sh"
+    env "$@" /bin/bash --noprofile --norc -p -e -o pipefail "$STEPS_DIR/control-plane.sh"
   ) >"$out_file" 2>&1
   local status=$?
   set -e
@@ -1012,7 +1063,7 @@ test_control_plane_success_and_superseded() {
 
   set_control_env
   touch "$NEUTRAL_DIR/re.py" "$NEUTRAL_DIR/sitecustomize.py" "$NEUTRAL_DIR/usercustomize.py"
-  run_control_script "$out" PYTHONPATH="$NEUTRAL_DIR" PYTHONSTARTUP="$NEUTRAL_DIR/re.py" HOME="$NEUTRAL_DIR" || fail "control success should pass"
+  run_control_script "$out" HOME="$NEUTRAL_DIR" || fail "control success should pass"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "success" ]; then
     fail "successful control step did not emit success"
   fi
@@ -1021,7 +1072,7 @@ test_control_plane_success_and_superseded() {
   assert_file_not_contains "$out" "synthetic-secret-token"
 
   set_control_env
-  run_control_script "$out" ORIGIN_DEV_SHA=2222222222222222222222222222222222222222 || fail "superseded should be a managed result"
+  run_control_script "$out" FIXTURE_DEV_MOVED=1 || fail "superseded should be a managed result"
   if [ "$(read_output "$GITHUB_OUTPUT" result)" != "superseded" ]; then
     fail "superseded guard did not emit superseded"
   fi
@@ -1138,10 +1189,8 @@ test_control_plane_failure_modes() {
   # The CLI is a Node entrypoint. A PATH-resolved node or inherited NODE_OPTIONS
   # must never start the token-bearing control-plane process.
   set_control_env
-  run_control_script "$out" NODE_OPTIONS=--require=/tmp/poison-123456.js NODE_PATH=/tmp/poison-node-path
-  if [ "$(read_output "$GITHUB_OUTPUT" result)" != "success" ]; then
-    fail "control step should sanitize Node startup environment and still succeed"
-  fi
+  run_control_script "$out" NODE_OPTIONS=--require=/tmp/poison-123456.js NODE_PATH=/tmp/poison-node-path && fail "inherited Node startup injection must now fail closed"
+  assert_file_contains "$out" 'Unsafe inherited environment'
   if [ -s "$PATH_NODE_MARKER" ]; then
     fail "token-bearing control step invoked a PATH-resolved node"
   fi
@@ -1449,7 +1498,8 @@ test_finalize_result_gate() {
 
   export GITHUB_OUTPUT="$output"
   export CONTROL_RESULT=success
-  export SMOKE_RESULT=
+  export SMOKE_RESULT=success
+  export SMOKE_OUTCOME=success
   export DEPLOYMENT_URL=https://candidate.vercel.app
   export PROMOTED_ALIASES=pythonlife.org,staging.lm.fm
   : > "$GITHUB_OUTPUT"
@@ -1479,8 +1529,286 @@ test_shell_validation() {
   pass "extracted workflow shell validates"
 }
 
+test_defense_environment() {
+  /usr/bin/python3 - "$WORKFLOW_FILE" <<'PYTHON'
+import sys,yaml
+steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+for step in steps:
+    if step.get('id') in ('control','smoke'):
+        assert step.get('shell')=='/bin/bash --noprofile --norc -p -e -o pipefail {0}', 'privileged absolute shell required'
+PYTHON
+  local out="$TMP_ROOT/defense.out" name
+  for name in BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONSTARTUP NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NODE_TLS_REJECT_UNAUTHORIZED GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL; do
+    set_control_env
+    prepare_context "$out" || fail "context preparation"
+    run_prepared_control_script "$out" "$name=" && fail "inherited $name must fail even when empty"
+    assert_file_contains "$out" 'Unsafe inherited environment'
+    [ ! -s "$VERCEL_LOG" ] || fail "poison reached CLI"
+    set_smoke_env
+    run_script "$STEPS_DIR/smoke.sh" "$out" "$name=" && fail "smoke inherited $name must fail"
+    assert_file_contains "$out" 'Unsafe inherited environment'
+    [ ! -s "$CURL_ARGV_LOG" ] || fail "poison reached curl"
+  done
+  set_control_env
+  export ARGV_LOG="$TMP_ROOT/scrub.log"
+  : > "$ARGV_LOG"
+  run_control_script "$out" UNREVIEWED_SENTINEL=poison HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" || fail "scrubbed control"
+  /usr/bin/python3 - "$ARGV_LOG" "$TMP_ROOT" <<'PYTHON'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1])]
+assert rows and all(r['sentinel']=='' and r['path']=='/usr/bin:/bin' and r['home']!=sys.argv[2] and r['tmp'] and r['tmp']!=sys.argv[2] for r in rows)
+PYTHON
+  pass "P1-1 defense rejects inherited injection and scrubs control env"
+}
+
+test_build_process_group() {
+  local out="$TMP_ROOT/build-group.out"
+  set_control_env
+  unset VERCEL_TOKEN
+  rm -rf "$CONTROL_WORKDIR/.vercel"
+  export BUILD_DAEMON_PID="$TMP_ROOT/build-daemon.pid"
+  (
+    cd "$CONTROL_WORKDIR"
+    run_script "$STEPS_DIR/build.sh" "$out"
+  ) || { cat "$out" >&2; fail "build group cleanup"; }
+  [ -s "$BUILD_DAEMON_PID" ] || fail "daemon fixture did not start"
+  local pid
+  read -r pid < "$BUILD_DAEMON_PID"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    fail "build daemon survived"
+  fi
+  pass "P1-1 defense build process group is killed and verified"
+}
+
+test_build_cleanup_failure() {
+  local out="$TMP_ROOT/build-cleanup-failure.out" status=0
+  set_control_env
+  unset VERCEL_TOKEN
+  rm -rf "$CONTROL_WORKDIR/.vercel"
+  export BUILD_DAEMON_PID="$TMP_ROOT/cleanup-daemon.pid"
+  # Test-only OS fault: simulate a kill that returns without removing the group.
+  # Verification must prevent the successful source receipt from being emitted.
+  sed 's/os.killpg(child.pid, signal.SIGKILL)/pass # synthetic no-op kill/' "$STEPS_DIR/build.sh" > "$TMP_ROOT/cleanup-fault.sh"
+  ( cd "$CONTROL_WORKDIR"; run_script "$TMP_ROOT/cleanup-fault.sh" "$out" ) || status=$?
+  if [ -s "$BUILD_DAEMON_PID" ]; then
+    local pid
+    read -r pid < "$BUILD_DAEMON_PID"
+    kill "$pid" 2>/dev/null || true
+  fi
+  [ "$status" != 0 ] || fail "surviving group must fail the build"
+  [ ! -s "$GITHUB_OUTPUT" ] || fail "cleanup failure emitted a successful build receipt"
+  assert_file_contains "$out" 'Build process group survived cleanup'
+  pass "P1-1 defense cleanup verification fails before build handoff"
+}
+
+test_fresh_homes() {
+  local out="$TMP_ROOT/homes.out"
+  set_control_env
+  export ARGV_LOG="$TMP_ROOT/build-homes.log"
+  : > "$ARGV_LOG"
+  unset VERCEL_TOKEN
+  rm -rf "$CONTROL_WORKDIR/.vercel"
+  ( cd "$CONTROL_WORKDIR"; run_script "$STEPS_DIR/build.sh" "$out" HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" UNREVIEWED_SENTINEL=poison ) || fail "fresh-home build"
+  /usr/bin/python3 - "$ARGV_LOG" "$TMP_ROOT" <<'PYTHON'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1])]
+assert rows and all(r['home']!=sys.argv[2] and r['tmp'] and r['tmp']!=sys.argv[2] and r['path']=='/usr/bin:/bin' and r['sentinel']=='' for r in rows)
+PYTHON
+  set_smoke_env
+  run_script "$STEPS_DIR/smoke.sh" "$out" HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" UNREVIEWED_SENTINEL=poison VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "fresh-home smoke"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = success ] || fail "smoke must succeed"
+  assert_file_not_contains "$CURL_LOG" "home=$TMP_ROOT "
+  assert_file_not_contains "$CURL_LOG" 'sentinel=poison'
+  assert_file_not_contains "$CURL_LOG" "tmp=$TMP_ROOT "
+  [ "$(grep -Fc 'path=/usr/bin:/bin sentinel=' "$CURL_LOG")" = 3 ] || fail "smoke needs fixed PATH and scrubbed env"
+  pass "P2-5 build/smoke get fresh HOME/TMPDIR and scrubbed env"
+}
+
+test_private_fetch_credentials() {
+  local out="$TMP_ROOT/private-fetch.out"
+  set_control_env
+  export FIXTURE_FETCH_LOG="$TMP_ROOT/fetch.log"
+  : > "$FIXTURE_FETCH_LOG"
+  run_script "$STEPS_DIR/verify-source.sh" "$out" || fail "private initial fetch"
+  run_control_script "$out" || fail "private refresh fetch"
+  [ "$(grep -Fc 'authenticated-fetch' "$FIXTURE_FETCH_LOG")" = 2 ] || fail "both fetches must use explicit read credentials"
+  assert_file_not_contains "$out" synthetic-read-token
+  assert_file_not_contains "$VERCEL_LOG" synthetic-read-token
+  pass "P2-1 both fetches use ephemeral read credential helper"
+}
+
+test_no_token_argv() {
+  local out="$TMP_ROOT/argv.out"
+  set_control_env
+  export ARGV_LOG="$TMP_ROOT/argv.log"
+  : > "$ARGV_LOG"
+  run_control_script "$out" || fail "control must run"
+  /usr/bin/python3 - "$ARGV_LOG" <<'PYTHON'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1])]
+assert rows and any(r['token']=='synthetic-secret-token' for r in rows)
+assert all('synthetic-secret-token' not in ' '.join(r['argv']) for r in rows), 'token in argv'
+PYTHON
+  pass "P1-2 CLI receives token only in environment"
+}
+
+test_early_bypass_gate() {
+  local out="$TMP_ROOT/early.out"
+  # Extract the actual first step; an empty secret must stop the job before
+  # the extracted deploy control can be invoked.
+  local first
+  first=$(awk '/^      - name: / {sub(/^      - name: /, ""); print; exit}' "$WORKFLOW_FILE")
+  extract_step "$first" "$TMP_ROOT/first.sh"
+  set_control_env
+  if [ "$first" = 'Preflight trusted tools' ]; then
+    common_preflight_env
+    materialize_preflight "$TMP_ROOT/first.sh"
+  fi
+  if run_script "$TMP_ROOT/first.sh" "$out" BYPASS_CONFIGURED=false NODE_VERSION_FILE=.node-version EXPECTED_VERCEL_CLI_VERSION=56.3.1; then
+    run_control_script "$out"
+  fi
+  assert_file_contains "$out" "VERCEL_AUTOMATION_BYPASS_SECRET not configured"
+  [ ! -s "$VERCEL_LOG" ] || fail "missing bypass invoked control plane"
+  pass "P1-3 missing bypass stops first step before deploy/alias"
+}
+
+test_dev_membership() {
+  local out="$TMP_ROOT/membership.out"
+  export EXPECTED_SHA=1111111111111111111111111111111111111111
+  export GIT_BIN="$STUB_DIR/git" READ_TOKEN=synthetic-read-token
+  export GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app
+  export GITHUB_OUTPUT="$TMP_ROOT/membership-output"
+  run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 && fail "non-dev SHA must be rejected before build"
+  assert_file_contains "$out" "not an ancestor"
+  set_control_env
+  run_control_script "$out" FIXTURE_NOT_ANCESTOR=1 || true
+  assert_file_not_contains "$VERCEL_LOG" 'alias set '
+  assert_file_contains "$out" "not an ancestor"
+  set_control_env
+  run_control_script "$out" FIXTURE_DEV_MOVED=1 || true
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = superseded ] || fail "fresh dev tip must supersede"
+  assert_file_not_contains "$VERCEL_LOG" 'alias set '
+  pass "P2-1 fetched dev membership and fresh tip gate promotion"
+}
+
+test_smoke_outcome_required() {
+  local out="$TMP_ROOT/outcome.out"
+  export GITHUB_OUTPUT="$TMP_ROOT/outcome-output"
+  for outcome in success failure cancelled skipped ''; do
+    : > "$GITHUB_OUTPUT"
+    run_script "$STEPS_DIR/finalize.sh" "$out" CONTROL_RESULT=success SMOKE_RESULT= SMOKE_OUTCOME="$outcome" && fail "missing smoke result must fail ($outcome)"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "empty smoke result must emit failed"
+  done
+  : > "$GITHUB_OUTPUT"
+  run_script "$STEPS_DIR/finalize.sh" "$out" CONTROL_RESULT=success SMOKE_RESULT=success SMOKE_OUTCOME=failure && fail "failed smoke outcome must fail"
+  pass "P2-2 smoke output and outcome are both required"
+}
+
+test_candidate_host_boundary() {
+  local out="$TMP_ROOT/host.out" url
+  for url in 'https://a.b.vercel.app' 'https://a_vercel.vercel.app' 'https://candidate.vercel.app/path' 'https://candidate.vercel.app:443' 'https://candidate.vercel.app@elsewhere.example' 'https://elsewhere.example' 'http://candidate.vercel.app'; do
+    set_smoke_env
+    run_script "$STEPS_DIR/smoke.sh" "$out" DEPLOYMENT_URL="$url" VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || true
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "unsafe candidate accepted: $url"
+    [ ! -s "$CURL_ARGV_LOG" ] || fail "unsafe candidate sent bypass/request: $url"
+  done
+  pass "P2-3 candidate authority rejects unsafe hosts before requests"
+}
+
+test_explicit_rollback_anchor() {
+  local out="$TMP_ROOT/anchor.out" mode
+  for mode in alias_only ambiguous_anchor; do
+    set_control_env
+    run_control_script "$out" VERCEL_MODE="$mode" || true
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "ambiguous/missing deployment anchor accepted"
+    assert_file_not_contains "$VERCEL_LOG" 'alias set '
+  done
+  set_control_env
+  run_control_script "$out" FAIL_SECOND_ALIAS=1 || fail "rollback should be managed"
+  assert_file_contains "$VERCEL_LOG" 'alias set https://old-pythonlife.org.vercel.app pythonlife.org'
+  assert_file_not_contains "$VERCEL_LOG" 'alias set https://moving.vercel.app'
+  pass "P2-4 rollback uses explicit unambiguous deployment fields"
+}
+
+test_first_validation_and_pins() {
+  /usr/bin/python3 - "$WORKFLOW_FILE" <<'PYTHON'
+import re,sys,yaml
+steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+build=next(i for i,s in enumerate(steps) if s.get('id')=='build')
+prep=next(i for i,s in enumerate(steps) if s.get('id')=='prep')
+assert prep < build, 'allowlist must precede build'
+settings=next(i for i,s in enumerate(steps) if s['name']=='Validate reviewed project settings')
+assert settings < build, 'settings validation precedes build'
+assert steps[0]['env']['BYPASS_CONFIGURED'] == "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET != '' }}"
+assert steps[0]['env']['NODE_VERSION_FILE'] == '${{ inputs.node_version_file }}'
+assert next(s for s in steps if s.get('id')=='finalize')['env']['SMOKE_OUTCOME']=='${{ steps.smoke.outcome }}'
+assert steps[0]['name']=='Validate staging inputs', 'input validation must run first'
+for step in steps:
+    if 'uses' in step:
+        assert re.search(r'@[0-9a-f]{40}$',step['uses']), 'action must use full SHA'
+PYTHON
+  extract_step 'Validate staging inputs' "$TMP_ROOT/inputs.sh"
+  local out="$TMP_ROOT/inputs.out" file
+  for file in '../version' '/tmp/version' 'a/../version' 'a//version' ''; do
+    run_script "$TMP_ROOT/inputs.sh" "$out" BYPASS_CONFIGURED=true NODE_VERSION_FILE="$file" EXPECTED_SHA=1111111111111111111111111111111111111111 PROJECT_SETTINGS_JSON='{"framework":null}' && fail "unsafe version path accepted"
+    assert_file_contains "$out" 'Invalid node_version_file'
+  done
+  run_script "$TMP_ROOT/inputs.sh" "$out" BYPASS_CONFIGURED=true NODE_VERSION_FILE=.node-version EXPECTED_SHA=not-a-sha && fail "invalid SHA accepted"
+  assert_file_contains "$out" 'Invalid expected_sha'
+  extract_step 'Validate reviewed project settings' "$TMP_ROOT/early-settings.sh"
+  local settings
+  for settings in '{}' 'not-json' '[]' '{"env":"synthetic"}' '{"framework":true}' '{"rootDirectory":"apps/web"}'; do
+    run_script "$TMP_ROOT/early-settings.sh" "$out" PYTHON_BIN=/usr/bin/python3 PROJECT_SETTINGS_JSON="$settings" && fail "invalid settings accepted before checkout"
+    assert_file_contains "$out" 'Invalid reviewed project_settings'
+  done
+  assert_file_contains "$WORKFLOW_FILE" 'required reviewers'
+  assert_file_contains "$WORKFLOW_FILE" 'deployment-branch restriction to dev'
+  assert_file_contains "$WORKFLOW_FILE" '# v4.2.2'
+  assert_file_contains "$WORKFLOW_FILE" '# v4.4.0'
+  pass "P2-5 inputs/allowlist precede build; actions pinned; P3 version path"
+}
+
+test_hash_before_execution() {
+  local out="$TMP_ROOT/hash-first.out" script="$TMP_ROOT/hash-first.sh"
+  common_preflight_env
+  materialize_preflight "$script"
+  run_script "$script" "$out" SHA_MODE=mismatch && fail "hash mismatch must fail"
+  [ ! -s "$NODE_LOG" ] || fail "CLI executed before hash validation"
+  pass "P3 CLI hash checked before execution"
+}
+
+test_rollback_files_cleaned() {
+  local out="$TMP_ROOT/rollback-clean.out"
+  set_control_env
+  run_control_script "$out" FAIL_SECOND_ALIAS=1 || fail "managed rollback"
+  [ -z "$(find "$NEUTRAL_DIR" -name 'vercel-staging-rollback-*' -type f -print)" ] || fail "rollback files remain"
+  pass "P3 rollback files cleaned"
+}
+
+unset BUILD_DAEMON_PID
+unset GIT_CEILING_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONSTARTUP NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NODE_TLS_REJECT_UNAUTHORIZED
 extract_steps
 install_stubs
+if [ -n "${TEST_ONLY:-}" ]; then
+  "$TEST_ONLY"
+  exit
+fi
+test_build_cleanup_failure
+test_fresh_homes
+test_private_fetch_credentials
+test_defense_environment
+test_build_process_group
+test_no_token_argv
+test_early_bypass_gate
+test_dev_membership
+test_smoke_outcome_required
+test_candidate_host_boundary
+test_explicit_rollback_anchor
+test_first_validation_and_pins
+test_hash_before_execution
+test_rollback_files_cleaned
 test_static_contract
 test_preflight_vercel_cli
 test_verify_exact_source
