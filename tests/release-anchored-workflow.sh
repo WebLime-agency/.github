@@ -473,9 +473,10 @@ chmod +x "$TOOL_FIXTURE"
 
 tool_case() {  # owner perms candidate -> prints "rc|resolved|output"
   (
+    # shellcheck disable=SC2034  # Consumed by resolve_tool in the sourced fixture.
     STAT_BIN="$TMP_ROOT/fake-stat"
     export FAKE_OWNER="$1" FAKE_PERMS="$2"
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091  # Generated fixture is only available at runtime.
     . "$TMP_ROOT/tool-funcs.sh"
     # Deliberately NOT a command substitution: that is the subshell trap this
     # whole block exists to catch, and it would swallow RESOLVED_TOOL here too.
@@ -514,8 +515,10 @@ grep -q "printf -v CAL_TODAY" "$STEPS_DIR/tag.sh"   || fail "the CalVer tag must
 grep -qE 'STAT_BIN=.*|/usr/bin/stat' "$STEPS_DIR/tools.sh"   || fail "stat itself must be resolved absolutely"
 pass "the preflight pins stat absolutely and neutralises system git config"
 
+# shellcheck disable=SC2016  # Match literal workflow source, without expansion.
 grep -q 'GIT_CONFIG_GLOBAL=${ISOLATED_HOME}/gitconfig' "$STEPS_DIR/tools.sh" \
   || fail "preflight must replace ~/.gitconfig with a fresh per-run file"
+# shellcheck disable=SC2016  # Match literal workflow source, without expansion.
 grep -q 'GH_CONFIG_DIR=${ISOLATED_HOME}/gh' "$STEPS_DIR/tools.sh" \
   || fail "preflight must point gh at a fresh per-run config directory"
 grep -q 'GITHUB_PATH' "$STEPS_DIR/tools.sh" \
@@ -524,6 +527,7 @@ TOOLS_LINE=$(grep -n '      - name: Verify the toolchain$' "$WORKFLOW_FILE" | cu
 CHECKOUT_LINE=$(grep -n 'uses: actions/checkout@' "$WORKFLOW_FILE" | cut -d: -f1)
 [ "$TOOLS_LINE" -lt "$CHECKOUT_LINE" ] \
   || fail "global git config must be neutralised before actions/checkout runs"
+# shellcheck disable=SC2088  # Tilde is literal text in a test description.
 pass "~/.gitconfig and gh config are isolated before actions/checkout runs"
 
 # GIT_CONFIG_GLOBAL is silently ignored before git 2.32, which would leave

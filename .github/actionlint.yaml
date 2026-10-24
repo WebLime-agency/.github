@@ -1,0 +1,4 @@
+# Recognize the existing reusable workflows' custom runner label.
+self-hosted-runner:
+  labels:
+    - weblime-ci
