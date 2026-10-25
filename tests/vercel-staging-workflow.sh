@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW_FILE=${WORKFLOW_FILE:-"$ROOT_DIR/.github/workflows/vercel-staging-reusable.yml"}
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/vercel-staging-workflow-test.XXXXXXXX")
+TMP_ROOT=$(cd -- "$TMP_ROOT" && pwd -P)
 STEPS_DIR="$TMP_ROOT/steps"
 STUB_DIR="$TMP_ROOT/bin"
 export STUB_DIR
@@ -1809,15 +1810,99 @@ test_rollback_files_cleaned() {
 }
 
 
-test_control_candidate_authority() {
-  local out="$TMP_ROOT/control-host.out"
+reject_control_candidate() {
+  local url=$1 regression_case=$2 out="$TMP_ROOT/control-host.out"
   set_control_env
-  run_control_script "$out" FIXTURE_DEPLOY_URL=https://a.b.vercel.app FIXTURE_PLAIN_ANCHOR=1 || fail "control host fixture startup"
-  if ! { [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] && ! grep -Fq 'alias set ' "$VERCEL_LOG" && ! grep -Fq 'inspect https://a.b.vercel.app' "$VERCEL_LOG"; }; then
-    fail "REGRESSION:control_candidate invalid host reached readiness/promotion"
+  run_control_script "$out" FIXTURE_DEPLOY_URL="$url" FIXTURE_PLAIN_ANCHOR=1 || fail "control host fixture startup"
+  if ! { [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] && ! grep -Fq 'alias set ' "$VERCEL_LOG" && ! grep -Fq 'inspect ' "$VERCEL_LOG"; }; then
+    fail "REGRESSION:$regression_case invalid candidate reached readiness/promotion: $url"
   fi
-  assert_file_contains "$out" 'Invalid candidate deployment host'
-  pass "control rejects strict-invalid candidate before readiness or alias mutation"
+  grep -Eq 'Invalid candidate deployment host|Unable to parse deployment URL' "$out" || fail "missing candidate rejection annotation"
+}
+
+test_control_candidate_authority() {
+  reject_control_candidate https://a.b.vercel.app control_candidate
+  reject_control_candidate https://candidate.vercel.app. candidate_trailing_dot
+  pass "control rejects multi-label and trailing-dot candidates before readiness or alias mutation"
+}
+
+test_control_candidate_trailing_dot() {
+  reject_control_candidate https://candidate.vercel.app. candidate_trailing_dot
+  pass "trailing authority dot is preserved for strict rejection"
+}
+
+test_control_candidate_trailing_comma() {
+  reject_control_candidate 'https://candidate.vercel.app,' candidate_trailing_comma
+  pass "trailing comma remains part of the token and is rejected"
+}
+
+test_control_candidate_trailing_paren() {
+  reject_control_candidate 'https://candidate.vercel.app)' candidate_trailing_paren
+  pass "trailing parenthesis remains part of the token and is rejected"
+}
+
+test_control_candidate_punctuation() {
+  local url
+  for url in 'https://candidate.vercel.app.)' 'https://candidate.vercel.app.,' \
+    'https://candidate.vercel.app.,)' 'https://candidate.vercel.app.evil)' \
+    'https://candidate.vercel.app.evil,' 'https://candidate.vercel.app@elsewhere.example)' \
+    'https://candidate.vercel.app:443,' 'https://candidate.vercel.app,)'; do
+    reject_control_candidate "$url" candidate_punctuation
+  done
+  pass "punctuation cannot hide a non-canonical authority"
+}
+
+test_control_candidate_token_boundary() {
+  local url
+  for url in 'https://candidate.vercel.app。elsewhere.example' 'https://candidate.vercel.app．elsewhere.example' \
+    'https://candidate.vercel.app｡elsewhere.example'; do
+    reject_control_candidate "$url" candidate_token_boundary
+  done
+  pass "non-ASCII URL suffixes cannot truncate the candidate authority"
+}
+
+test_control_candidate_case() {
+  reject_control_candidate 'https://CANDIDATE.vercel.app' candidate_case
+  pass "candidate case is not folded before validation"
+}
+
+test_control_candidate_encoding() {
+  reject_control_candidate 'https://%63andidate.vercel.app' candidate_encoding
+  pass "candidate URL escapes are not decoded before validation"
+}
+
+test_control_candidate_whitespace() {
+  reject_control_candidate $'https://candi\tdate.vercel.app' candidate_whitespace
+  local text out="$TMP_ROOT/context-text.out"
+  for text in $'notice\nhttps://candidate.vercel.app\n' 'notice https://candidate.vercel.app ready'; do
+    set_control_env
+    run_control_script "$out" FIXTURE_DEPLOY_URL="$text" FIXTURE_PLAIN_ANCHOR=1 || fail "surrounding-text fixture startup"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = success ] || fail "surrounding log text must not change the canonical token"
+    [ "$(read_output "$GITHUB_OUTPUT" deployment_url)" = https://candidate.vercel.app ] || fail "parser changed a canonical URL token"
+    [ "$(grep -Fc 'alias set https://candidate.vercel.app ' "$VERCEL_LOG")" = 2 ] || fail "only the extracted unchanged host may be promoted"
+  done
+  pass "authority whitespace is rejected; surrounding log text leaves the URL token unchanged"
+}
+
+test_noncanonical_tmpdir_suite() {
+  # The child runs the whole suite once; suppress recursive child spawning.
+  [ "${STAGING_NONCANONICAL_CHILD:-0}" != 1 ] || return 0
+  local out="$TMP_ROOT/noncanonical-suite.out" status=0
+  local target=${STAGING_TMPDIR_HARNESS:-${BASH_SOURCE[0]}}
+  mkdir -p "$TMP_ROOT/scratchpad" "$TMP_ROOT/tmp9"
+  env -u TEST_ONLY -u REGRESSION_CASE TMPDIR="$TMP_ROOT/scratchpad/../tmp9" \
+    STAGING_NONCANONICAL_CHILD=1 KEEP_TMP=1 bash "$target" > "$out" 2>&1 || status=$?
+  if [ "$status" != 0 ]; then
+    local binding_logs
+    binding_logs=$(find "$TMP_ROOT/tmp9" -name control-host.out -exec grep -lF '::error title=Staging build binding failed::' {} +)
+    if [ -n "$binding_logs" ]; then
+      fail "REGRESSION:tmpdir_suite non-canonical TMPDIR broke exact-source binding"
+    fi
+    cat "$out" >&2
+    fail "non-canonical TMPDIR child failed outside the binding assertion"
+  fi
+  grep -Eq '^All [0-9]+ vercel staging workflow tests passed\.$' "$out" || fail "child did not complete the full suite"
+  pass "full suite passes with TMPDIR containing parent-directory components"
 }
 
 test_post_promotion_dev_move() {
@@ -2068,6 +2153,14 @@ if [ -n "${TEST_ONLY:-}" ]; then
   exit
 fi
 test_control_candidate_authority
+test_control_candidate_trailing_dot
+test_control_candidate_trailing_comma
+test_control_candidate_trailing_paren
+test_control_candidate_punctuation
+test_control_candidate_token_boundary
+test_control_candidate_case
+test_control_candidate_encoding
+test_control_candidate_whitespace
 test_post_promotion_dev_move
 test_post_promotion_rollback_failure
 test_post_promotion_fetch_failure
@@ -2110,5 +2203,6 @@ test_smoke_rejects_unsafe_landings
 test_smoke_rejects_unsafe_bypass_value
 test_finalize_result_gate
 test_shell_validation
+test_noncanonical_tmpdir_suite
 
 echo "All $pass_count vercel staging workflow tests passed."

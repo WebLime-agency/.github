@@ -8,10 +8,14 @@ promotion regressions against --baseline 96ff8a89. Each case must first pass on
 the fixed workflow and then fail with its own assertion marker. Tests and
 mutations operate on temporary workflow copies;
 no checkout edits, service calls, credentials, or workflow dispatches occur.
+The TMPDIR case uses the reviewed 0c3b5128 harness with the fixed workflow as its
+baseline. An already-safe whitespace audit is verified as a pass, never credited
+as a failing-baseline regression.
 """
 import argparse
 import os
 import re
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -168,6 +172,15 @@ CASES = [(name, *CASE_IDS[name], mutate) for name, _, mutate in MUTATIONS] + [
     ('R8 post-promotion dev check', 'post_promotion_tip', 'test_post_promotion_dev_move', lambda s: post_promotion(s, lambda _: '')),
     ('R8 rollback must verify', 'post_rollback_failure', 'test_post_promotion_rollback_failure', lambda s: replace(s, 'if rollback_aliases; then', 'if rollback_aliases || true; then')),
     ('R8 post-fetch failure rolls back', 'post_fetch_failure', 'test_post_promotion_fetch_failure', lambda s: post_promotion(s, lambda b: replace(b, 'rollback_aliases || true', 'set_result failed'))),
+    ('R9 trailing dot normalization', 'candidate_trailing_dot', 'test_control_candidate_trailing_dot', lambda s: replace(s, 'print(match.group(0))', 'print(match.group(0).rstrip(".,)"))')),
+    ('R9 trailing comma normalization', 'candidate_trailing_comma', 'test_control_candidate_trailing_comma', lambda s: replace(s, 'print(match.group(0))', 'print(match.group(0).rstrip(","))')),
+    ('R9 trailing parenthesis normalization', 'candidate_trailing_paren', 'test_control_candidate_trailing_paren', lambda s: replace(s, 'print(match.group(0))', 'print(match.group(0).rstrip(")"))')),
+    ('R9 complete token extraction', 'candidate_token_boundary', 'test_control_candidate_token_boundary', lambda s: replace(s, r'match = re.search(r"https://\S+", text)', r'''match = re.search(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+\.vercel\.app[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*", text)''')),
+    ('R9 candidate case folding', 'candidate_case', 'test_control_candidate_case', lambda s: replace(s, 'print(match.group(0))', 'print(match.group(0).lower())')),
+    ('R9 candidate URL decoding', 'candidate_encoding', 'test_control_candidate_encoding', lambda s: replace(s, 'print(match.group(0))', 'print(__import__("urllib.parse", fromlist=["unquote"]).unquote(match.group(0)))')),
+    ('R9 candidate whitespace folding', 'candidate_whitespace', 'test_control_candidate_whitespace', lambda s: replace(s, 'text = sys.argv[1]', 'text = "".join(sys.argv[1].split())')),
+    ('R9 canonical harness TMPDIR', 'tmpdir_suite', 'test_noncanonical_tmpdir_suite', lambda s: replace(s, 'TMP_ROOT=$(cd -- "$TMP_ROOT" && pwd -P)\n', '')),
+
 ]
 assert len({case_id for _, case_id, _, _ in CASES}) == len(CASES)
 
@@ -191,23 +204,51 @@ def main():
     baseline = None
     if args.baseline:
         baseline = subprocess.check_output(['git', 'show', args.baseline + ':.github/workflows/vercel-staging-reusable.yml'], cwd=ROOT, text=True)
+    # Whitespace was already rejected by the historical parser. Verify that
+    # positive baseline explicitly; never manufacture a failing-baseline claim.
+    baseline_already_safe = {'candidate_whitespace'}
+    baseline_safe_count = 0
     with tempfile.TemporaryDirectory(prefix='vercel-staging-mutations-') as tmp:
         for number, (name, case_id, test, mutate) in enumerate(cases, 1):
             # A passing assertion on the fixed workflow is a prerequisite for
             # mutation evidence. No test that always fails can get credit.
             env = os.environ | {'TEST_ONLY': test, 'REGRESSION_CASE': case_id, 'WORKFLOW_FILE': str(WORKFLOW)}
-            positive = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            positive = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=180)
             if positive.returncode != 0:
                 raise SystemExit(f'FIXED-WORKFLOW PRECONDITION FAILED: {name}\n{positive.stdout}{positive.stderr}')
             path = Path(tmp) / f'{number}.yml'
-            path.write_text(baseline if baseline is not None else mutate(current))
-            result = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env | {'WORKFLOW_FILE': str(path)}, capture_output=True, text=True, timeout=60)
+            negative_env = env | {'WORKFLOW_FILE': str(path)}
+            if case_id == 'tmpdir_suite':
+                # Isolate the harness defect using the fixed workflow. The
+                # reviewed round-9 harness is the raw baseline for this case;
+                # older harnesses lack the current CLI/credential fixtures.
+                source = HARNESS.read_text()
+                if baseline is not None:
+                    source = subprocess.check_output(['git', 'show', '0c3b5128f7f130932093dd10a157e236f70f3c32:tests/vercel-staging-workflow.sh'], cwd=ROOT, text=True)
+                else:
+                    source = mutate(source)
+                # Relocate the copied script without changing repo discovery.
+                source = '\n'.join('ROOT_DIR=' + shlex.quote(str(ROOT)) if line.startswith('ROOT_DIR=') else line for line in source.splitlines()) + '\n'
+                path.write_text(source)
+                negative_env = env | {'STAGING_TMPDIR_HARNESS': str(path)}
+            else:
+                path.write_text(baseline if baseline is not None else mutate(current))
+            result = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=negative_env, capture_output=True, text=True, timeout=180)
             output = result.stdout + result.stderr
+            if baseline is not None and case_id in baseline_already_safe:
+                if result.returncode != 0:
+                    raise SystemExit(f'EXPECTED SAFE BASELINE FAILED: {name}\n{output}')
+                baseline_safe_count += 1
+                print(f'already safe {number}/{len(cases)} - {name}: baseline rejects the input; not credited as a failure', flush=True)
+                continue
             if not verify_failure(result.returncode, output, case_id):
                 raise SystemExit(f'NO CASE-SPECIFIC EVIDENCE: {name} (exit {result.returncode})\n{output}')
             evidence = next(line for line in output.splitlines() if line.startswith(('not ok - REGRESSION:', 'AssertionError: REGRESSION:')))
             print(f'caught {number}/{len(cases)} - {name}: {evidence}', flush=True)
-    print(f'All {len(cases)} {"baseline regressions reproduced" if args.baseline else "mutations caught"} with case-specific evidence.')
+    if args.baseline:
+        print(f'Baseline: {len(cases) - baseline_safe_count} case-specific regressions reproduced; {baseline_safe_count} already-safe assertions verified. Harness baseline: 0c3b5128.')
+    else:
+        print(f'All {len(cases)} mutations caught with case-specific evidence.')
 
 
 if __name__ == '__main__':

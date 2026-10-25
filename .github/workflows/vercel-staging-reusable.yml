@@ -710,10 +710,12 @@ jobs:
           import re
           import sys
           text = sys.argv[1]
-          match = re.search(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+\.vercel\.app[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*", text)
+          # Extract the whole HTTPS token; never truncate an unfamiliar suffix.
+          match = re.search(r"https://\S+", text)
           if not match:
               raise SystemExit("missing Vercel deployment URL")
-          print(match.group(0).rstrip(".,)"))
+          # No punctuation trimming, case folding, whitespace folding or URL decoding.
+          print(match.group(0))
           PY
           }
 
