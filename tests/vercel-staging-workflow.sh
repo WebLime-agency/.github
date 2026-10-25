@@ -82,6 +82,7 @@ extract_step() {
       in_run = 1
       next
     }
+    in_run && /^  [A-Za-z0-9_-]+:/ { exit }
     in_run {
       print substr($0, 11)
     }
@@ -103,6 +104,7 @@ extract_step_block() {
       }
       in_step = ($0 == "      - name: " step)
     }
+    in_step && /^  [A-Za-z0-9_-]+:/ { exit }
     in_step {
       print
     }
@@ -132,6 +134,13 @@ extract_steps() {
   mkdir -p "$STEPS_DIR"
   extract_step "Preflight trusted tools" "$STEPS_DIR/preflight.sh"
   extract_step "Verify exact source" "$STEPS_DIR/verify-source.sh"
+  if grep -Fq '  preflight:' "$WORKFLOW_FILE"; then
+    extract_step "Verify dev ancestry" "$STEPS_DIR/dev-source.sh"
+    extract_step "Validate staging artifact" "$STEPS_DIR/artifact.sh"
+    extract_step "Allocate staging artifact directory" "$STEPS_DIR/allocate.sh"
+  else
+    cp "$STEPS_DIR/verify-source.sh" "$STEPS_DIR/dev-source.sh"
+  fi
   extract_step "Build Vercel staging output" "$STEPS_DIR/build.sh"
   extract_step "Prepare staging aliases" "$STEPS_DIR/prepare-aliases.sh"
   extract_step "Prepare staging deploy context" "$STEPS_DIR/deploy-context.sh"
@@ -259,7 +268,7 @@ while [[ "${1:-}" == --git-dir=* ]] || [ "${1:-}" = -c ]; do
   else shift; fi
 done
 case "$1" in
-  init) exit 0 ;;
+  init) mkdir -p "${@: -1}"; exit 0 ;;
   merge-base) [ "${FIXTURE_NOT_ANCESTOR:-0}" != 1 ]; exit $? ;;
   fetch)
     if [ -n "${FIXTURE_POST_MOVE:-}" ]; then
@@ -620,8 +629,10 @@ test_static_contract() {
   assert_file_contains "$WORKFLOW_FILE" "https://github.com/eba8/mission-control/issues/413"
 assert_file_contains "$WORKFLOW_FILE" "dedicated"
   assert_file_contains "$WORKFLOW_FILE" "Root Directory setting MUST also be empty"
-  assert_file_not_contains "$WORKFLOW_FILE" "upload-artifact"
-  assert_file_not_contains "$WORKFLOW_FILE" "download-artifact"
+  # C' explicitly supersedes artifact-free. Boundary assertions live in
+  # test_job_graph; both actions must now exist and be SHA-pinned.
+  assert_file_contains "$WORKFLOW_FILE" "upload-artifact@"
+  assert_file_contains "$WORKFLOW_FILE" "download-artifact@"
   assert_file_not_contains "$WORKFLOW_FILE" "npm install -g vercel"
   assert_file_not_contains "$WORKFLOW_FILE" "vercel pull"
 
@@ -694,8 +705,8 @@ import sys
 import yaml
 workflow = yaml.safe_load(open(sys.argv[1]))
 job = workflow['jobs']['deploy-staging']
-steps = job['steps']
-for scope in (workflow, job):
+steps = [s for j in workflow['jobs'].values() for s in j['steps']]
+for scope in (workflow, *workflow['jobs'].values()):
     assert not any('VERCEL_TOKEN' in k or 'BYPASS_SECRET' in k for k in scope.get('env', {}))
 token_steps = [s for s in steps if 'VERCEL_TOKEN' in s.get('env', {})]
 bypass_steps = [s for s in steps if 'VERCEL_AUTOMATION_BYPASS_SECRET' in s.get('env', {})]
@@ -704,10 +715,11 @@ assert len(bypass_steps) == 1 and bypass_steps[0]['id'] == 'smoke'
 build = next(s for s in steps if s.get('id') == 'build')
 control = token_steps[0]
 context = next(s for s in steps if s.get('id') == 'deploy_context')
-assert context['working-directory'] == build['working-directory']
+assert context['working-directory'] == '${{ runner.temp }}'
 assert control['working-directory'] == '${{ runner.temp }}'
-assert context['env']['BUILD_SOURCE_DIR'] == '${{ steps.build.outputs.source_dir }}'
-assert context['env']['BUILD_SOURCE_SHA'] == '${{ steps.build.outputs.source_sha }}'
+assert context['env']['ARTIFACT_DIR'] == '${{ steps.transfer.outputs.incoming_dir }}'
+assert 'BUILD_SOURCE_DIR' not in context['env']
+assert 'environment' not in workflow['jobs']['build']
 assert control['env']['DEPLOY_DIR'] == '${{ steps.deploy_context.outputs.deploy_dir }}'
 assert control['env']['DEPLOY_SOURCE_SHA'] == '${{ steps.deploy_context.outputs.source_sha }}'
 assert build['env']['PROJECT_SETTINGS_JSON'] == '${{ inputs.project_settings }}'
@@ -716,7 +728,7 @@ assert bypass_steps[0]['env']['NEUTRAL_DIR'] == '${{ runner.temp }}'
 assert build['env']['EXPECTED_SHA'] == '${{ inputs.expected_sha }}'
 PYTHON
 
-  pass "static workflow contract is artifact-free and secrets are step-scoped"
+  pass "C-prime artifact boundary and step-scoped secrets preserve the caller contract"
 }
 
 test_preflight_vercel_cli() {
@@ -832,6 +844,7 @@ test_prepare_alias_allowlist() {
 set_control_env() {
   export PATH="$STUB_DIR:$PATH"
   export GITHUB_OUTPUT="$TMP_ROOT/control-output"
+  export MAX_OUTPUT_MIB=40
   export EXPECTED_SHA=1111111111111111111111111111111111111111
   export ORIGIN_DEV_SHA=1111111111111111111111111111111111111111
   export STAGING_ALIASES=pythonlife.org,staging.lm.fm
@@ -868,11 +881,33 @@ prepare_context() {
   local out_file=$1
   local context_output="$TMP_ROOT/context-output"
   : > "$context_output"
-  (
-    cd "$CONTROL_WORKDIR"
-    unset VERCEL_TOKEN
-    GITHUB_OUTPUT="$context_output" run_script "$STEPS_DIR/deploy-context.sh" "$out_file"
-  ) || return 1
+  if [ -f "$STEPS_DIR/artifact.sh" ]; then
+    local artifact_output="$TMP_ROOT/artifact-output" incoming_output="$TMP_ROOT/incoming-output"
+    : > "$artifact_output"
+    : > "$incoming_output"
+    (
+      cd "$CONTROL_WORKDIR"
+      unset VERCEL_TOKEN
+      GITHUB_OUTPUT="$artifact_output" run_script "$STEPS_DIR/artifact.sh" "$out_file"
+    ) || return 1
+    GITHUB_OUTPUT="$incoming_output" run_script "$STEPS_DIR/allocate.sh" "$out_file" || return 1
+    export ARTIFACT_DIR
+    ARTIFACT_DIR=$(read_output "$incoming_output" incoming_dir)
+    # Synthetic upload/download: copy ONLY the declared output payload. No
+    # source, project settings or build-runner paths enter the deploy job.
+    cp -a "$(read_output "$artifact_output" artifact_dir)/." "$ARTIFACT_DIR/"
+    (
+      cd "$NEUTRAL_DIR"
+      unset VERCEL_TOKEN
+      GITHUB_OUTPUT="$context_output" run_script "$STEPS_DIR/deploy-context.sh" "$out_file"
+    ) || return 1
+  else
+    (
+      cd "$CONTROL_WORKDIR"
+      unset VERCEL_TOKEN
+      GITHUB_OUTPUT="$context_output" run_script "$STEPS_DIR/deploy-context.sh" "$out_file"
+    ) || return 1
+  fi
   export DEPLOY_DIR DEPLOY_SOURCE_SHA
   DEPLOY_DIR=$(read_output "$context_output" deploy_dir)
   DEPLOY_SOURCE_SHA=$(read_output "$context_output" source_sha)
@@ -1555,7 +1590,7 @@ test_shell_validation() {
 test_defense_environment() {
   /usr/bin/python3 - "$WORKFLOW_FILE" <<'PYTHON'
 import sys,yaml
-steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+steps=[s for j in yaml.safe_load(open(sys.argv[1]))['jobs'].values() for s in j['steps']]
 for step in steps:
     if step.get('id') in ('control','smoke'):
         assert step.get('shell')=='/bin/bash --noprofile --norc -p -e -o pipefail {0}', 'privileged absolute shell required'
@@ -1653,7 +1688,7 @@ test_private_fetch_credentials() {
   set_control_env
   export FIXTURE_FETCH_LOG="$TMP_ROOT/fetch.log"
   : > "$FIXTURE_FETCH_LOG"
-  run_script "$STEPS_DIR/verify-source.sh" "$out" || fail "private initial fetch"
+  run_script "$STEPS_DIR/dev-source.sh" "$out" || fail "private initial fetch"
   run_control_script "$out" || fail "private refresh fetch"
   [ "$(grep -Fc 'authenticated-fetch' "$FIXTURE_FETCH_LOG")" = 3 ] || fail "source and both control fetches must use explicit read credentials"
   assert_file_not_contains "$out" synthetic-read-token
@@ -1702,7 +1737,7 @@ test_dev_membership() {
   export GIT_BIN="$STUB_DIR/git" READ_TOKEN=synthetic-read-token
   export GITHUB_REPOSITORY_NAME=WebLime-agency/limey-web-app
   export GITHUB_OUTPUT="$TMP_ROOT/membership-output"
-  run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 && fail "non-dev SHA must be rejected before build"
+  run_script "$STEPS_DIR/dev-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 && fail "non-dev SHA must be rejected before build"
   assert_file_contains "$out" "not an ancestor"
   set_control_env
   run_control_script "$out" FIXTURE_NOT_ANCESTOR=1 || true
@@ -1757,7 +1792,7 @@ test_explicit_rollback_anchor() {
 test_first_validation_and_pins() {
   /usr/bin/python3 - "$WORKFLOW_FILE" <<'PYTHON'
 import re,sys,yaml
-steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+steps=[s for j in yaml.safe_load(open(sys.argv[1]))['jobs'].values() for s in j['steps']]
 build=next(i for i,s in enumerate(steps) if s.get('id')=='build')
 prep=next(i for i,s in enumerate(steps) if s.get('id')=='prep')
 assert prep < build, 'allowlist must precede build'
@@ -1961,7 +1996,8 @@ test_regression_case() {
     allowlist_order|input_order|checkout_pin|setup_node_pin|settings_order|privileged_shell)
       /usr/bin/python3 - "$WORKFLOW_FILE" "$regression_case" <<'PYTHON'
 import re,sys,yaml
-steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+jobs=yaml.safe_load(open(sys.argv[1]))['jobs']
+steps=[s for j in jobs.values() for s in j['steps']]
 case=sys.argv[2]
 def index(name):
     return next((i for i,s in enumerate(steps) if s['name']==name),len(steps))
@@ -1970,7 +2006,7 @@ def step(name):
 checks={
  'allowlist_order': index('Prepare staging aliases') < index('Build Vercel staging output'),
  'input_order': index('Validate staging inputs')==0,
- 'settings_order': index('Validate reviewed project settings') < index('Build Vercel staging output'),
+ 'settings_order': index('Validate reviewed project settings') < index('Build Vercel staging output') and ('preflight' not in jobs or any(s.get('name')=='Validate reviewed project settings' for s in jobs['preflight']['steps'])),
  'checkout_pin': bool(re.fullmatch(r'actions/checkout@[0-9a-f]{40}',step('Checkout exact staging source').get('uses',''))),
  'setup_node_pin': bool(re.fullmatch(r'actions/setup-node@[0-9a-f]{40}',step('Setup Node.js').get('uses',''))),
  'privileged_shell': step('Vercel control-plane deploy/promote').get('shell')=='/bin/bash --noprofile --norc -p -e -o pipefail {0}',
@@ -1996,7 +2032,7 @@ PYTHON
       ;;
     initial_ancestry)
       set_control_env
-      run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 || status=$?
+      run_script "$STEPS_DIR/dev-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 || status=$?
       if ! { [ "$status" = 1 ] && grep -Fq 'not an ancestor' "$out"; }; then
         fail "REGRESSION:initial_ancestry non-dev SHA accepted before build"
       fi
@@ -2015,7 +2051,7 @@ PYTHON
       export FIXTURE_FETCH_LOG="$TMP_ROOT/focused-fetch.log"
       : > "$FIXTURE_FETCH_LOG"
       if [ "$regression_case" != promotion_refetch ]; then
-        run_script "$STEPS_DIR/verify-source.sh" "$out" || status=$?
+        run_script "$STEPS_DIR/dev-source.sh" "$out" || status=$?
         if ! { [ "$status" = 0 ] && [ "$(grep -c authenticated-fetch "$FIXTURE_FETCH_LOG" || true)" = 1 ]; }; then
           fail "REGRESSION:$regression_case initial authenticated fetch absent"
         fi
@@ -2143,6 +2179,138 @@ PYTHON
   pass "independent regression: $regression_case"
 }
 
+# C' graph assertions are independent so each mutation must fail its own case.
+test_job_graph_case() {
+  /usr/bin/python3 - "$WORKFLOW_FILE" "${JOB_GRAPH_CASE:?}" <<'PYTHON'
+import json,re,sys,yaml
+w=yaml.safe_load(open(sys.argv[1])); jobs=w['jobs']; case=sys.argv[2]
+p=jobs.get('preflight',{}); b=jobs.get('build',{}); d=jobs.get('deploy-staging',{})
+def step(job, key):
+    return next((s for s in job.get('steps',[]) if s.get('id',s.get('name'))==key),{})
+def action(job, prefix):
+    return next((s for s in job.get('steps',[]) if s.get('uses','').startswith(prefix+'@')), {})
+u=action(b,'actions/upload-artifact'); a=action(d,'actions/download-artifact')
+labels=['self-hosted','Linux','X64','weblime-ci','weblime-staging-deploy']
+name='staging-output-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.expected_sha }}'
+checks={
+ 'graph_order': list(jobs)==['preflight','build','deploy-staging'],
+ 'preflight_runner': p.get('runs-on')==labels,
+ 'build_runner': b.get('runs-on')==['self-hosted','Linux','X64','weblime-ci-build'],
+ 'deploy_runner': d.get('runs-on')==labels,
+ 'build_needs': b.get('needs')=='preflight',
+ 'deploy_needs': d.get('needs')==['preflight','build'],
+ 'build_environment': bool(b) and 'environment' not in b,
+ 'preflight_environment': bool(p) and 'environment' not in p,
+ 'staging_environment': d.get('environment')=='staging',
+ 'build_secrets': bool(b) and 'secrets.' not in json.dumps(b),
+ 'build_token': bool(b) and 'VERCEL_TOKEN' not in json.dumps(b) and 'VERCEL_AUTOMATION_BYPASS_SECRET' not in json.dumps(b),
+ 'build_permissions': b.get('permissions')=={'contents':'read'},
+ 'build_variables': bool(b) and all(step(b,'build').get('env',{}).get(k)=='${{ vars.'+k+' }}' for k in ('VERCEL_ORG_ID','VERCEL_PROJECT_ID','PUBLIC_SUPABASE_URL','PUBLIC_SUPABASE_ANON_KEY','PUBLIC_SITE_URL','PUBLIC_APP_ENV','PUBLIC_TURNSTILE_SITE_KEY')),
+ 'upload_pin': u.get('uses')=='actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+ 'download_pin': a.get('uses')=='actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+ 'retention': u.get('with',{}).get('retention-days')==1,
+ 'missing_artifact': u.get('with',{}).get('if-no-files-found')=='error',
+ 'hidden_artifact': u.get('with',{}).get('include-hidden-files') is True,
+ 'artifact_name': u.get('with',{}).get('name')==name and a.get('with',{}).get('name')==name,
+ 'artifact_path': u.get('with',{}).get('path')=='${{ steps.artifact.outputs.artifact_dir }}',
+ 'deploy_checkout': bool(d) and not any(s.get('uses','').startswith('actions/checkout@') for s in d.get('steps',[])),
+ 'preflight_gate': bool(p.get('steps')) and p['steps'][0].get('id')=='inputs' and step(p,'inputs').get('env',{}).get('BYPASS_CONFIGURED')=="${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET != '' }}" and 'VERCEL_AUTOMATION_BYPASS_SECRET not configured' in step(p,'inputs').get('run',''),
+ 'preflight_ancestry': 'merge-base --is-ancestor' in step(p,'source').get('run','') and 'fetch_dev' in step(p,'source').get('run',''),
+ 'size_default': w.get('on',w.get(True,{})).get('workflow_call',{}).get('inputs',{}).get('max_output_mib',{}).get('default')==40,
+ 'fresh_download': a.get('with',{}).get('path')=='${{ steps.transfer.outputs.incoming_dir }}' and 'mktemp -d' in step(d,'transfer').get('run',''),
+ 'handoff': step(d,'deploy_context').get('env',{}).get('ARTIFACT_DIR')=='${{ steps.transfer.outputs.incoming_dir }}' and step(d,'control').get('env',{}).get('ORIGIN_DEV_SHA')=='${{ needs.preflight.outputs.origin_dev_sha }}' and step(d,'control').get('env',{}).get('STAGING_ALIASES')=='${{ needs.preflight.outputs.aliases }}',
+}
+assert checks[case], f'REGRESSION:{case} C-prime job/artifact contract absent'
+PYTHON
+  pass "C' graph: $JOB_GRAPH_CASE"
+}
+
+test_job_graph() {
+  local case
+  for case in graph_order preflight_runner build_runner deploy_runner build_needs deploy_needs \
+    build_environment preflight_environment staging_environment build_secrets build_token build_permissions \
+    build_variables upload_pin download_pin retention missing_artifact hidden_artifact artifact_name artifact_path \
+    deploy_checkout preflight_gate preflight_ancestry size_default fresh_download handoff; do
+    JOB_GRAPH_CASE=$case test_job_graph_case
+  done
+}
+
+test_artifact_boundary_case() {
+  local case=${ARTIFACT_CASE:?} out="$TMP_ROOT/artifact-boundary.out" status=0
+  set_control_env
+  export MAX_OUTPUT_MIB=1
+  if [ "$case" = artifact_control_size ]; then
+    prepare_context "$out" || fail "control artifact fixture preparation"
+    /usr/bin/python3 - "$DEPLOY_DIR/.vercel/output/large" <<'PYTHON'
+import sys
+with open(sys.argv[1],'wb') as f: f.truncate(1024*1024)
+PYTHON
+    run_prepared_control_script "$out" MAX_OUTPUT_MIB=1 || status=$?
+    if [ "$(read_output "$GITHUB_OUTPUT" result)" != failed ] || [ -s "$VERCEL_LOG" ]; then
+      fail "REGRESSION:$case oversized output reached control CLI"
+    fi
+    grep -Fq 'Output size cap exceeded' "$out" || fail "missing control size annotation"
+  else
+    local step='Validate staging artifact' path="$CONTROL_WORKDIR/.vercel/output"
+    if [[ "$case" == artifact_deploy_* ]]; then step='Prepare staging deploy context'; fi
+    grep -Fq "      - name: $step" "$WORKFLOW_FILE" || fail "REGRESSION:$case missing artifact gate"
+    extract_step_block "$step" "$TMP_ROOT/gate-block"
+    if [[ "$case" == artifact_deploy_* ]] && ! grep -Fq 'ARTIFACT_DIR:' "$TMP_ROOT/gate-block"; then
+      fail "REGRESSION:$case missing download validation boundary"
+    fi
+    extract_step "$step" "$TMP_ROOT/artifact-gate.sh"
+    if [[ "$case" == artifact_deploy_* ]]; then
+      export ARTIFACT_DIR
+      ARTIFACT_DIR=$(mktemp -d "$NEUTRAL_DIR/vercel-staging-incoming-XXXXXXXX")
+      cp -a "$path/." "$ARTIFACT_DIR/"
+      path=$ARTIFACT_DIR
+    fi
+    if [[ "$case" == *_size ]]; then
+      /usr/bin/python3 - "$path/large" <<'PYTHON'
+import sys
+with open(sys.argv[1],'wb') as f: f.truncate(1024*1024)
+PYTHON
+    else
+      mkdir -p "$path/functions/probe.func/nested"
+      printf 'module.exports={};\n' > "$path/functions/probe.func/nested/vercel.cjs"
+    fi
+    (
+      if [[ "$case" == artifact_deploy_* ]]; then cd "$NEUTRAL_DIR"; else cd "$CONTROL_WORKDIR"; fi
+      run_script "$TMP_ROOT/artifact-gate.sh" "$out"
+    ) || status=$?
+    local annotation='Unsafe prebuilt output'
+    [[ "$case" != *_size ]] || annotation='Output size cap exceeded'
+    if [ "$status" != 1 ] || [ -s "$GITHUB_OUTPUT" ] || ! grep -Fq "$annotation" "$out"; then
+      fail "REGRESSION:$case artifact crossed the validation boundary"
+    fi
+  fi
+  rm -f "$CONTROL_WORKDIR/.vercel/output/large"
+  rm -rf "$CONTROL_WORKDIR/.vercel/output/functions/probe.func"
+  pass "artifact boundary: $case"
+}
+
+test_max_output_input() {
+  grep -Fq 'MAX_OUTPUT_MIB:' "$WORKFLOW_FILE" || fail "REGRESSION:max_output_input size cap validator absent"
+  extract_step 'Validate staging inputs' "$TMP_ROOT/cap-input.sh"
+  local value out="$TMP_ROOT/cap-input.out" status
+  for value in 0 -1 1.5 invalid ''; do
+    status=0
+    run_script "$TMP_ROOT/cap-input.sh" "$out" BYPASS_CONFIGURED=true EXPECTED_SHA=1111111111111111111111111111111111111111 NODE_VERSION_FILE=.node-version MAX_OUTPUT_MIB="$value" || status=$?
+    if [ "$status" != 1 ] || ! grep -Fq 'Invalid max_output_mib' "$out"; then
+      fail "REGRESSION:max_output_input invalid size cap accepted"
+    fi
+  done
+  pass "size cap input requires a positive integral MiB value"
+}
+
+test_artifact_boundaries() {
+  local case
+  for case in artifact_build_size artifact_deploy_size artifact_control_size artifact_build_policy artifact_deploy_policy; do
+    ARTIFACT_CASE=$case test_artifact_boundary_case
+  done
+}
+
+export MAX_OUTPUT_MIB=40
 unset BUILD_DAEMON_PID
 unset GIT_CEILING_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
 unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONSTARTUP NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NODE_TLS_REJECT_UNAUTHORIZED
@@ -2153,6 +2321,9 @@ if [ -n "${TEST_ONLY:-}" ]; then
   exit
 fi
 test_control_candidate_authority
+test_job_graph
+test_artifact_boundaries
+test_max_output_input
 test_control_candidate_trailing_dot
 test_control_candidate_trailing_comma
 test_control_candidate_trailing_paren

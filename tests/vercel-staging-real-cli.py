@@ -23,7 +23,7 @@ if not cli.is_file() or hashlib.sha256(cli.read_bytes()).hexdigest() != PIN:
     sys.exit(77)
 cli = cli.resolve()
 workflow = yaml.safe_load((Path(__file__).resolve().parent.parent / '.github/workflows/vercel-staging-reusable.yml').read_text())
-steps = {s.get('id', s['name']): s for s in workflow['jobs']['deploy-staging']['steps']}
+steps = {s.get('id', s['name']): s for s in [s for j in workflow['jobs'].values() for s in j['steps']]}
 sha = '1' * 40
 
 with tempfile.TemporaryDirectory(prefix='vercel-real-cli-offline-') as tmp:
@@ -121,7 +121,7 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
         'OFFLINE_GUARD': str(guard), 'OFFLINE_NETWORK_LOG': str(root / 'network.log'),
         'OFFLINE_CWD_LOG': str(root / 'cwd.log'),
         'NODE_BIN': str(node), 'VERCEL_BIN': str(cli), 'PYTHON_BIN': '/usr/bin/python3',
-        'NEUTRAL_DIR': str(neutral), 'EXPECTED_SHA': sha, 'ORIGIN_DEV_SHA': sha,
+        'MAX_OUTPUT_MIB': '40', 'NEUTRAL_DIR': str(neutral), 'EXPECTED_SHA': sha, 'ORIGIN_DEV_SHA': sha,
         'VERCEL_ORG_ID': 'team_offline_fixture', 'VERCEL_PROJECT_ID': 'prj_offline_fixture',
         'PROJECT_SETTINGS_JSON': json.dumps({'framework': None, 'installCommand': '', 'buildCommand': '', 'outputDirectory': 'public', 'rootDirectory': None, 'nodeVersion': '22.x'}),
         'STAGING_ALIASES': 'pythonlife.org,staging.lm.fm', 'JQ_BIN': '/usr/bin/jq',
@@ -141,7 +141,7 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
     version = run(['/usr/bin/node', '--require', str(guard), '--', str(cli), '--version'], neutral)
     require(version.returncode == 0 and version.stdout.strip() == '56.3.1', 'real CLI version mismatch', version)
     scripts = {}
-    for key in ('build', 'deploy_context', 'control', 'Clean staging deploy context', 'smoke'):
+    for key in ('build', 'artifact', 'deploy_context', 'control', 'Clean staging deploy context', 'smoke'):
         script = root / (key.replace(' ', '-') + '.sh')
         # Test-only transport hooks are added to extracted copies. The deployed
         # workflow has no hook variables in its environment allowlist.
@@ -155,6 +155,14 @@ exec /usr/bin/node --require "$OFFLINE_GUARD" -- "$@" --api http://127.0.0.1:9 -
         scripts[key] = script
 
     def step(key, cwd, extra=None):
+        if key == 'deploy_context':
+            gate, outputs = step('artifact', cwd, extra)
+            if gate.returncode:
+                return gate, outputs
+            incoming = Path(tempfile.mkdtemp(prefix='vercel-staging-incoming-', dir=neutral))
+            shutil.copytree(cwd / '.vercel/output', incoming, dirs_exist_ok=True, symlinks=True)
+            extra = (extra or {}) | {'ARTIFACT_DIR': str(incoming)}
+            cwd = neutral
         Path(env['GITHUB_OUTPUT']).write_text('')
         result = run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(scripts[key])], cwd, extra)
         outputs = dict(line.split('=', 1) for line in Path(env['GITHUB_OUTPUT']).read_text().splitlines() if '=' in line)

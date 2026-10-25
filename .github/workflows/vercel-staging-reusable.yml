@@ -1,15 +1,23 @@
 name: Vercel Staging Deploy (reusable)
 
 # Central reusable workflow - lives in WebLime-agency/.github.
-# Trusted staging path for governed dev releases. This workflow is artifact-free
-# and runs on the long-lived shared weblime-ci runner. A1/A2 hardening reduces
-# runner risk, but true host isolation is still tracked by:
+# Trusted staging path for governed dev releases. C' separates preflight,
+# untrusted build and credential-bearing deployment into three self-hosted jobs.
+# The build runner uses a separate unprivileged OS user; this is the boundary.
+# Same-machine/kernel and persistent-build risks remain tracked by:
 # https://github.com/eba8/mission-control/issues/413
 #
-# Process-group cleanup and scrubbed environments below are defense in depth,
-# NOT an isolation boundary. Same-user code can escape a process group or read
-# same-user files/processes. P1-1 remains open, awaiting isolation decision.
-# Operator preconditions:
+# Process-group cleanup and scrubbed environments remain defense in depth.
+# They are not the boundary; separate OS identities and private directories are.
+# Operator preconditions (provisioning is external to this reusable):
+# - Provision an org runner labelled weblime-ci-build under a separate
+#   unprivileged OS user, with a private home and private temp directory,
+#   no sudo and no docker-group membership. Keep this persistent build label
+#   exclusive to this workflow; hostile builds may leave build-user files.
+# - Add weblime-staging-deploy to the trusted runner(s) holding the pinned
+#   toolchain. Never run the build runner under the deploy runner's OS user.
+# - Same machine/kernel and reachable local-service vulnerabilities remain
+#   residual risks; this design does not claim machine-level isolation.
 # - Recommend required reviewers and a deployment-branch restriction to dev
 #   for the consumer's staging environment; the reusable does not enforce these.
 # - Private dev fetches use the caller's ephemeral contents:read GitHub token
@@ -69,6 +77,11 @@ on:
         required: false
         type: string
         default: .node-version
+      max_output_mib:
+        description: "Maximum uncompressed prebuilt output size in integral MiB; enforced before upload and again before deployment."
+        required: false
+        type: number
+        default: 40
       vercel_cli_version:
         description: "Pinned operator-provisioned Vercel CLI version to verify."
         required: false
@@ -97,14 +110,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy-staging:
-    name: Deploy staging to Vercel
-    runs-on: [self-hosted, Linux, X64, weblime-ci]
-    environment: staging
+  preflight:
+    name: Validate governed staging release
+    runs-on: [self-hosted, Linux, X64, weblime-ci, weblime-staging-deploy]
     outputs:
-      deployment_url: ${{ steps.finalize.outputs.deployment_url }}
-      promoted_aliases: ${{ steps.finalize.outputs.promoted_aliases }}
-      result: ${{ steps.finalize.outputs.result }}
+      aliases: ${{ steps.prep.outputs.aliases }}
+      origin_dev_sha: ${{ steps.source.outputs.origin_dev_sha }}
     steps:
       - name: Validate staging inputs
         id: inputs
@@ -113,6 +124,7 @@ jobs:
           BYPASS_CONFIGURED: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET != '' }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+          MAX_OUTPUT_MIB: ${{ inputs.max_output_mib }}
         run: |
           set -euo pipefail
           if [ "$BYPASS_CONFIGURED" != true ]; then
@@ -125,6 +137,11 @@ jobs:
           fi
           if [[ ! "$NODE_VERSION_FILE" =~ ^[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*$ ]] || [[ "/$NODE_VERSION_FILE/" == */../* ]] || [[ "/$NODE_VERSION_FILE/" == */./* ]]; then
             echo "::error::Invalid node_version_file"
+            exit 1
+          fi
+
+          if [[ ! "$MAX_OUTPUT_MIB" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid max_output_mib: supply a positive integral MiB value."
             exit 1
           fi
 
@@ -334,6 +351,219 @@ jobs:
               raise SystemExit("::error::Invalid reviewed project_settings")
           PYTHON
 
+      - name: Verify dev ancestry
+        id: source
+        env:
+          READ_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GIT_BIN: ${{ steps.tools.outputs.git }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          validation_dir=$(/usr/bin/mktemp -d "$NEUTRAL_DIR/vercel-staging-dev-XXXXXXXX")
+          trap '/usr/bin/rm -rf -- "$validation_dir"' EXIT
+          "$GIT_BIN" init --bare --quiet "$validation_dir/repo.git"
+          cd "$validation_dir/repo.git"
+          read_token=${READ_TOKEN:-}
+          unset READ_TOKEN
+          # persist-credentials:false is intentional. Use the job-scoped,
+          # contents:read GitHub token only in this fetch subprocess; disable
+          # stored helpers. Nothing is written to repository credential config.
+          # shellcheck disable=SC2016 # The credential helper expands in git, not this shell.
+          fetch_dev() {
+            READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0 "$GIT_BIN" \
+              -c credential.helper= \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$READ_TOKEN"; }; f' \
+              fetch --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY_NAME.git" \
+              '+refs/heads/dev:refs/remotes/origin/dev'
+          }
+          fetch_dev
+          ORIGIN_DEV_SHA="$("$GIT_BIN" rev-parse refs/remotes/origin/dev)"
+          if ! "$GIT_BIN" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then
+            echo "::error::expected_sha is not an ancestor of origin/dev"
+            exit 1
+          fi
+          echo "origin_dev_sha=$ORIGIN_DEV_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build untrusted staging output
+    needs: preflight
+    runs-on: [self-hosted, Linux, X64, weblime-ci-build]
+    permissions:
+      contents: read
+    steps:
+      - name: Preflight trusted tools
+        id: tools
+        env:
+          EXPECTED_VERCEL_CLI_VERSION: ${{ inputs.vercel_cli_version }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED_PINNED_VERSION="56.3.1"
+          EXPECTED_VERCEL_CLI_PATH="/opt/weblime/vercel/56.3.1/vercel"
+          EXPECTED_VERCEL_CLI_SHA256="c0e8cfad56746ea7a496604fc8b1e9ef71624d1784f07415a41777bdddb2536f"
+
+          if [ "$EXPECTED_VERCEL_CLI_VERSION" != "$EXPECTED_PINNED_VERSION" ]; then
+            echo "::error title=Unsupported Vercel CLI version::This reusable is reviewed only for Vercel CLI $EXPECTED_PINNED_VERSION."
+            exit 1
+          fi
+
+          walk_tool_chain() {
+            local name=$1
+            local path=$2
+            local current=$path
+
+            while :; do
+              local metadata owner mode
+              if ! metadata="$(/usr/bin/stat -Lc '%u %a' "$current" 2>/dev/null)"; then
+                echo "::error title=$name metadata failure::Unable to verify ownership and permissions for $current." >&2
+                exit 1
+              fi
+              read -r owner mode <<< "$metadata"
+              if [ "$owner" != "0" ]; then
+                echo "::error title=Untrusted $name owner::$current must be root-owned." >&2
+                exit 1
+              fi
+              if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+                echo "::error title=Unsafe $name permissions::$current must not be group- or world-writable." >&2
+                exit 1
+              fi
+              [ "$current" = "/" ] && break
+              current=${current%/*}
+              [ -z "$current" ] && current="/"
+            done
+          }
+
+          require_abs_tool() {
+            local name=$1
+            local path=$2
+
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name path::$name must resolve to an absolute path." >&2
+                exit 1
+                ;;
+            esac
+
+            if [ ! -x "$path" ]; then
+              echo "::error title=Missing trusted $name::$path is not executable." >&2
+              exit 1
+            fi
+
+            # Reject both the lexical path chain and the fully resolved chain so
+            # a symlink into a writable directory cannot smuggle in a tool.
+            walk_tool_chain "$name" "$path"
+            local resolved
+            if ! resolved="$("$READLINK_BIN" -f -- "$path" 2>/dev/null)"; then
+              echo "::error title=$name resolution failure::Unable to canonicalize $path." >&2
+              exit 1
+            fi
+            walk_tool_chain "$name resolved" "$resolved"
+          }
+
+          resolve_path_tool() {
+            local name=$1
+            local path
+            if ! path="$(command -v "$name" 2>/dev/null)"; then
+              echo "::error title=Missing trusted $name::Unable to resolve $name on PATH for preflight." >&2
+              exit 1
+            fi
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name resolution::$name resolved to non-file command '$path'." >&2
+                exit 1
+                ;;
+            esac
+            require_abs_tool "$name" "$path"
+            printf '%s\n' "$path"
+          }
+
+          READLINK_BIN="/usr/bin/readlink"
+          if [ ! -x "$READLINK_BIN" ]; then
+            echo "::error title=Missing trusted readlink::$READLINK_BIN is not executable." >&2
+            exit 1
+          fi
+          walk_tool_chain "readlink" "$READLINK_BIN"
+
+          require_abs_tool "stat" "/usr/bin/stat"
+          require_abs_tool "sha256sum" "/usr/bin/sha256sum"
+          for tool_path in /usr/bin/env /bin/bash /usr/bin/mktemp /usr/bin/mkdir /usr/bin/rm /usr/bin/setsid; do
+            require_abs_tool "step tool" "$tool_path"
+          done
+
+          GIT_BIN="$(resolve_path_tool git)"
+          CURL_BIN="$(resolve_path_tool curl)"
+          JQ_BIN="$(resolve_path_tool jq)"
+          PYTHON_BIN="/usr/bin/python3"
+          require_abs_tool "python3" "$PYTHON_BIN"
+          NODE_BIN="/usr/bin/node"
+          require_abs_tool "node" "$NODE_BIN"
+          require_abs_tool "vercel" "$EXPECTED_VERCEL_CLI_PATH"
+
+          # The CLI is a Node entrypoint. Always start it through the
+          # preflighted absolute interpreter with a sanitized startup
+          # environment, never through /usr/bin/env node on PATH.
+          run_vercel_cli() {
+            (
+              cd "${RUNNER_TEMP:-/tmp}"
+              NODE_OPTIONS='' NODE_PATH='' "$NODE_BIN" -- "$EXPECTED_VERCEL_CLI_PATH" "$@"
+            )
+          }
+
+          read -r ACTUAL_VERCEL_CLI_SHA256 _ < <(/usr/bin/sha256sum "$EXPECTED_VERCEL_CLI_PATH")
+          if [ "$ACTUAL_VERCEL_CLI_SHA256" != "$EXPECTED_VERCEL_CLI_SHA256" ]; then
+            echo "::error title=Vercel CLI hash mismatch::The operator-provisioned CLI hash does not match the reviewed vercel@$EXPECTED_PINNED_VERSION binary."
+            exit 1
+          fi
+
+          VERCEL_VERSION_OUTPUT="$(run_vercel_cli --version 2>/dev/null || true)"
+          VERCEL_VERSION_LINE=""
+          while IFS= read -r version_line; do
+            version_line=${version_line%$'\r'}
+            if [ -n "$version_line" ]; then
+              VERCEL_VERSION_LINE=$version_line
+            fi
+          done <<< "$VERCEL_VERSION_OUTPUT"
+          if [ "$VERCEL_VERSION_LINE" != "$EXPECTED_VERCEL_CLI_VERSION" ] && [ "$VERCEL_VERSION_LINE" != "Vercel CLI $EXPECTED_VERCEL_CLI_VERSION" ]; then
+            echo "::error title=Vercel CLI version mismatch::Expected $EXPECTED_VERCEL_CLI_VERSION from the operator-provisioned CLI."
+            exit 1
+          fi
+
+          {
+            echo "git=$GIT_BIN"
+            echo "curl=$CURL_BIN"
+            echo "jq=$JQ_BIN"
+            echo "python=$PYTHON_BIN"
+            echo "node=$NODE_BIN"
+            echo "vercel=$EXPECTED_VERCEL_CLI_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate reviewed project settings
+        env:
+          PROJECT_SETTINGS_JSON: ${{ inputs.project_settings }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          PYTHONSAFEPATH=1 "$PYTHON_BIN" -I -S - <<'PYTHON'
+          import json, os
+          allowed = {"framework", "buildCommand", "installCommand", "devCommand", "outputDirectory", "rootDirectory", "nodeVersion"}
+          try:
+              settings = json.loads(os.environ["PROJECT_SETTINGS_JSON"])
+              if not isinstance(settings, dict) or not settings or set(settings) - allowed:
+                  raise ValueError()
+              if any(v is not None and not isinstance(v, str) for v in settings.values()):
+                  raise ValueError()
+              if settings.get("rootDirectory") not in (None, ""):
+                  raise ValueError()
+          except (KeyError, ValueError):
+              raise SystemExit("::error::Invalid reviewed project_settings")
+          PYTHON
+
       - name: Checkout exact staging source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -344,10 +574,8 @@ jobs:
           path: src-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify exact source
-        id: source
+        id: verify
         env:
-          READ_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           GIT_BIN: ${{ steps.tools.outputs.git }}
         working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
@@ -369,27 +597,6 @@ jobs:
             echo "::error title=Dirty checkout::The isolated staging checkout is not clean."
             exit 1
           fi
-
-          read_token=${READ_TOKEN:-}
-          unset READ_TOKEN
-          # persist-credentials:false is intentional. Use the job-scoped,
-          # contents:read GitHub token only in this fetch subprocess; disable
-          # stored helpers. Nothing is written to repository credential config.
-          # shellcheck disable=SC2016 # The credential helper expands in git, not this shell.
-          fetch_dev() {
-            READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0 "$GIT_BIN" \
-              -c credential.helper= \
-              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$READ_TOKEN"; }; f' \
-              fetch --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY_NAME.git" \
-              '+refs/heads/dev:refs/remotes/origin/dev'
-          }
-          fetch_dev
-          ORIGIN_DEV_SHA="$("$GIT_BIN" rev-parse refs/remotes/origin/dev)"
-          if ! "$GIT_BIN" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then
-            echo "::error::expected_sha is not an ancestor of origin/dev"
-            exit 1
-          fi
-          echo "origin_dev_sha=$ORIGIN_DEV_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -529,20 +736,18 @@ jobs:
             echo "source_sha=$EXPECTED_SHA"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Prepare staging deploy context
-        id: deploy_context
+      - name: Validate staging artifact
+        id: artifact
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           BUILD_SOURCE_DIR: ${{ steps.build.outputs.source_dir }}
           BUILD_SOURCE_SHA: ${{ steps.build.outputs.source_sha }}
+          MAX_OUTPUT_MIB: ${{ inputs.max_output_mib }}
           NEUTRAL_DIR: ${{ runner.temp }}
           PYTHON_BIN: ${{ steps.tools.outputs.python }}
-          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
         working-directory: src-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-
           SOURCE_DIR=$PWD
           if [ "${BUILD_SOURCE_DIR:-}" != "$SOURCE_DIR" ] || [ "${BUILD_SOURCE_SHA:-}" != "$EXPECTED_SHA" ] || [ ! -f "$SOURCE_DIR/.vercel/output/config.json" ]; then
             echo "::error title=Staging build binding failed::Missing output or build receipt does not match the exact-SHA checkout."
@@ -550,29 +755,267 @@ jobs:
           fi
           (
             cd "$NEUTRAL_DIR"
-            PYTHONSAFEPATH=1 PYTHONPATH='' PYTHONSTARTUP='' HOME="$NEUTRAL_DIR" "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
-          import json
+            PYTHONSAFEPATH=1 "$PYTHON_BIN" -I -S - "$SOURCE_DIR" <<'PYTHON'
           import os
           from pathlib import Path
-          import shutil
           import stat
           import sys
-          import tempfile
           def verify_output(output):
               pending = [output]
+              total = 0
+              max_bytes = int(os.environ["MAX_OUTPUT_MIB"]) * 1024 * 1024
               forbidden = {"vercel.ts", "vercel.mts", "vercel.js", "vercel.mjs", "vercel.cjs", "vercel.json", "vercel.toml"}
               while pending:
                   path = pending.pop()
-                  mode = path.lstat().st_mode
+                  metadata = path.lstat()
+                  mode = metadata.st_mode
                   if path.name.lower() in forbidden:
                       raise SystemExit("::error title=Unsafe prebuilt output::Vercel configuration is forbidden anywhere in prebuilt output.")
                   if stat.S_ISDIR(mode):
                       pending.extend(path.iterdir())
                   elif not stat.S_ISREG(mode):
                       raise SystemExit("::error title=Unsafe prebuilt output::Symlinks and non-regular files are forbidden in prebuilt output.")
+                  else:
+                      total += metadata.st_size
+              if total > max_bytes:
+                  raise SystemExit("::error title=Output size cap exceeded::Prebuilt output exceeds max_output_mib.")
           source_output = Path(sys.argv[1]) / ".vercel/output"
           if source_output.parent.is_symlink():
               raise SystemExit("::error title=Unsafe prebuilt output::Symlinked output parent refused.")
+          verify_output(source_output)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"artifact_dir={source_output}\nsource_sha={os.environ['EXPECTED_SHA']}\n")
+          PYTHON
+          )
+
+      - name: Upload staging output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-output-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.expected_sha }}
+          path: ${{ steps.artifact.outputs.artifact_dir }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+  deploy-staging:
+    name: Deploy staging to Vercel
+    needs: [preflight, build]
+    runs-on: [self-hosted, Linux, X64, weblime-ci, weblime-staging-deploy]
+    environment: staging
+    outputs:
+      deployment_url: ${{ steps.finalize.outputs.deployment_url }}
+      promoted_aliases: ${{ steps.finalize.outputs.promoted_aliases }}
+      result: ${{ steps.finalize.outputs.result }}
+    steps:
+      - name: Preflight trusted tools
+        id: tools
+        env:
+          EXPECTED_VERCEL_CLI_VERSION: ${{ inputs.vercel_cli_version }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED_PINNED_VERSION="56.3.1"
+          EXPECTED_VERCEL_CLI_PATH="/opt/weblime/vercel/56.3.1/vercel"
+          EXPECTED_VERCEL_CLI_SHA256="c0e8cfad56746ea7a496604fc8b1e9ef71624d1784f07415a41777bdddb2536f"
+
+          if [ "$EXPECTED_VERCEL_CLI_VERSION" != "$EXPECTED_PINNED_VERSION" ]; then
+            echo "::error title=Unsupported Vercel CLI version::This reusable is reviewed only for Vercel CLI $EXPECTED_PINNED_VERSION."
+            exit 1
+          fi
+
+          walk_tool_chain() {
+            local name=$1
+            local path=$2
+            local current=$path
+
+            while :; do
+              local metadata owner mode
+              if ! metadata="$(/usr/bin/stat -Lc '%u %a' "$current" 2>/dev/null)"; then
+                echo "::error title=$name metadata failure::Unable to verify ownership and permissions for $current." >&2
+                exit 1
+              fi
+              read -r owner mode <<< "$metadata"
+              if [ "$owner" != "0" ]; then
+                echo "::error title=Untrusted $name owner::$current must be root-owned." >&2
+                exit 1
+              fi
+              if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+                echo "::error title=Unsafe $name permissions::$current must not be group- or world-writable." >&2
+                exit 1
+              fi
+              [ "$current" = "/" ] && break
+              current=${current%/*}
+              [ -z "$current" ] && current="/"
+            done
+          }
+
+          require_abs_tool() {
+            local name=$1
+            local path=$2
+
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name path::$name must resolve to an absolute path." >&2
+                exit 1
+                ;;
+            esac
+
+            if [ ! -x "$path" ]; then
+              echo "::error title=Missing trusted $name::$path is not executable." >&2
+              exit 1
+            fi
+
+            # Reject both the lexical path chain and the fully resolved chain so
+            # a symlink into a writable directory cannot smuggle in a tool.
+            walk_tool_chain "$name" "$path"
+            local resolved
+            if ! resolved="$("$READLINK_BIN" -f -- "$path" 2>/dev/null)"; then
+              echo "::error title=$name resolution failure::Unable to canonicalize $path." >&2
+              exit 1
+            fi
+            walk_tool_chain "$name resolved" "$resolved"
+          }
+
+          resolve_path_tool() {
+            local name=$1
+            local path
+            if ! path="$(command -v "$name" 2>/dev/null)"; then
+              echo "::error title=Missing trusted $name::Unable to resolve $name on PATH for preflight." >&2
+              exit 1
+            fi
+            case "$path" in
+              /*) ;;
+              *)
+                echo "::error title=Untrusted $name resolution::$name resolved to non-file command '$path'." >&2
+                exit 1
+                ;;
+            esac
+            require_abs_tool "$name" "$path"
+            printf '%s\n' "$path"
+          }
+
+          READLINK_BIN="/usr/bin/readlink"
+          if [ ! -x "$READLINK_BIN" ]; then
+            echo "::error title=Missing trusted readlink::$READLINK_BIN is not executable." >&2
+            exit 1
+          fi
+          walk_tool_chain "readlink" "$READLINK_BIN"
+
+          require_abs_tool "stat" "/usr/bin/stat"
+          require_abs_tool "sha256sum" "/usr/bin/sha256sum"
+          for tool_path in /usr/bin/env /bin/bash /usr/bin/mktemp /usr/bin/mkdir /usr/bin/rm /usr/bin/setsid; do
+            require_abs_tool "step tool" "$tool_path"
+          done
+
+          GIT_BIN="$(resolve_path_tool git)"
+          CURL_BIN="$(resolve_path_tool curl)"
+          JQ_BIN="$(resolve_path_tool jq)"
+          PYTHON_BIN="/usr/bin/python3"
+          require_abs_tool "python3" "$PYTHON_BIN"
+          NODE_BIN="/usr/bin/node"
+          require_abs_tool "node" "$NODE_BIN"
+          require_abs_tool "vercel" "$EXPECTED_VERCEL_CLI_PATH"
+
+          # The CLI is a Node entrypoint. Always start it through the
+          # preflighted absolute interpreter with a sanitized startup
+          # environment, never through /usr/bin/env node on PATH.
+          run_vercel_cli() {
+            (
+              cd "${RUNNER_TEMP:-/tmp}"
+              NODE_OPTIONS='' NODE_PATH='' "$NODE_BIN" -- "$EXPECTED_VERCEL_CLI_PATH" "$@"
+            )
+          }
+
+          read -r ACTUAL_VERCEL_CLI_SHA256 _ < <(/usr/bin/sha256sum "$EXPECTED_VERCEL_CLI_PATH")
+          if [ "$ACTUAL_VERCEL_CLI_SHA256" != "$EXPECTED_VERCEL_CLI_SHA256" ]; then
+            echo "::error title=Vercel CLI hash mismatch::The operator-provisioned CLI hash does not match the reviewed vercel@$EXPECTED_PINNED_VERSION binary."
+            exit 1
+          fi
+
+          VERCEL_VERSION_OUTPUT="$(run_vercel_cli --version 2>/dev/null || true)"
+          VERCEL_VERSION_LINE=""
+          while IFS= read -r version_line; do
+            version_line=${version_line%$'\r'}
+            if [ -n "$version_line" ]; then
+              VERCEL_VERSION_LINE=$version_line
+            fi
+          done <<< "$VERCEL_VERSION_OUTPUT"
+          if [ "$VERCEL_VERSION_LINE" != "$EXPECTED_VERCEL_CLI_VERSION" ] && [ "$VERCEL_VERSION_LINE" != "Vercel CLI $EXPECTED_VERCEL_CLI_VERSION" ]; then
+            echo "::error title=Vercel CLI version mismatch::Expected $EXPECTED_VERCEL_CLI_VERSION from the operator-provisioned CLI."
+            exit 1
+          fi
+
+          {
+            echo "git=$GIT_BIN"
+            echo "curl=$CURL_BIN"
+            echo "jq=$JQ_BIN"
+            echo "python=$PYTHON_BIN"
+            echo "node=$NODE_BIN"
+            echo "vercel=$EXPECTED_VERCEL_CLI_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Allocate staging artifact directory
+        id: transfer
+        env:
+          NEUTRAL_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          incoming_dir=$(/usr/bin/mktemp -d "$NEUTRAL_DIR/vercel-staging-incoming-XXXXXXXX")
+          printf 'incoming_dir=%s\n' "$incoming_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Download staging output
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: staging-output-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.expected_sha }}
+          path: ${{ steps.transfer.outputs.incoming_dir }}
+
+      - name: Prepare staging deploy context
+        id: deploy_context
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ARTIFACT_DIR: ${{ steps.transfer.outputs.incoming_dir }}
+          MAX_OUTPUT_MIB: ${{ inputs.max_output_mib }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$NEUTRAL_DIR"
+            PYTHONSAFEPATH=1 "$PYTHON_BIN" -I -S - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import tempfile
+          def verify_output(output):
+              pending = [output]
+              total = 0
+              max_bytes = int(os.environ["MAX_OUTPUT_MIB"]) * 1024 * 1024
+              forbidden = {"vercel.ts", "vercel.mts", "vercel.js", "vercel.mjs", "vercel.cjs", "vercel.json", "vercel.toml"}
+              while pending:
+                  path = pending.pop()
+                  metadata = path.lstat()
+                  mode = metadata.st_mode
+                  if path.name.lower() in forbidden:
+                      raise SystemExit("::error title=Unsafe prebuilt output::Vercel configuration is forbidden anywhere in prebuilt output.")
+                  if stat.S_ISDIR(mode):
+                      pending.extend(path.iterdir())
+                  elif not stat.S_ISREG(mode):
+                      raise SystemExit("::error title=Unsafe prebuilt output::Symlinks and non-regular files are forbidden in prebuilt output.")
+                  else:
+                      total += metadata.st_size
+              if total > max_bytes:
+                  raise SystemExit("::error title=Output size cap exceeded::Prebuilt output exceeds max_output_mib.")
+          source_output = Path(os.environ["ARTIFACT_DIR"])
+          if not source_output.is_absolute() or source_output.is_symlink() or source_output.parent.resolve() != Path.cwd().resolve() or not source_output.name.startswith("vercel-staging-incoming-"):
+              raise SystemExit("::error title=Unsafe prebuilt output::Unexpected artifact download path.")
+          if not (source_output / "config.json").is_file():
+              raise SystemExit("::error title=Unsafe prebuilt output::Missing artifact config.json.")
           verify_output(source_output)
           # Preserve any racing symlink as a symlink, then reject it. Never
           # dereference source links while copying into the token-bearing cwd.
@@ -601,11 +1044,12 @@ jobs:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           DEPLOY_DIR: ${{ steps.deploy_context.outputs.deploy_dir }}
           DEPLOY_SOURCE_SHA: ${{ steps.deploy_context.outputs.source_sha }}
-          ORIGIN_DEV_SHA: ${{ steps.source.outputs.origin_dev_sha }}
+          ORIGIN_DEV_SHA: ${{ needs.preflight.outputs.origin_dev_sha }}
+          MAX_OUTPUT_MIB: ${{ inputs.max_output_mib }}
           READ_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_NAME: ${{ github.repository }}
           GIT_BIN: ${{ steps.tools.outputs.git }}
-          STAGING_ALIASES: ${{ steps.prep.outputs.aliases }}
+          STAGING_ALIASES: ${{ needs.preflight.outputs.aliases }}
           NEUTRAL_DIR: ${{ runner.temp }}
           JQ_BIN: ${{ steps.tools.outputs.jq }}
           PYTHON_BIN: ${{ steps.tools.outputs.python }}
@@ -639,6 +1083,7 @@ jobs:
           /usr/bin/env -i \
             PATH=/usr/bin:/bin HOME="$private_root/home" TMPDIR="$private_root/tmp" \
             CI=1 NO_UPDATE_NOTIFIER=1 VERCEL_TELEMETRY_DISABLED=1 \
+            MAX_OUTPUT_MIB="${MAX_OUTPUT_MIB:-}" \
             EXPECTED_SHA="${EXPECTED_SHA:-}" \
             DEPLOY_DIR="${DEPLOY_DIR:-}" \
             DEPLOY_SOURCE_SHA="${DEPLOY_SOURCE_SHA:-}" \
@@ -842,16 +1287,23 @@ jobs:
           import stat
           def verify_output(output):
               pending = [output]
+              total = 0
+              max_bytes = int(os.environ["MAX_OUTPUT_MIB"]) * 1024 * 1024
               forbidden = {"vercel.ts", "vercel.mts", "vercel.js", "vercel.mjs", "vercel.cjs", "vercel.json", "vercel.toml"}
               while pending:
                   path = pending.pop()
-                  mode = path.lstat().st_mode
+                  metadata = path.lstat()
+                  mode = metadata.st_mode
                   if path.name.lower() in forbidden:
                       raise SystemExit("::error title=Unsafe prebuilt output::Vercel configuration is forbidden anywhere in prebuilt output.")
                   if stat.S_ISDIR(mode):
                       pending.extend(path.iterdir())
                   elif not stat.S_ISREG(mode):
                       raise SystemExit("::error title=Unsafe prebuilt output::Symlinks and non-regular files are forbidden in prebuilt output.")
+                  else:
+                      total += metadata.st_size
+              if total > max_bytes:
+                  raise SystemExit("::error title=Output size cap exceeded::Prebuilt output exceeds max_output_mib.")
           deploy = Path(sys.argv[1])
           if not deploy.is_absolute() or deploy.is_symlink() or deploy.parent.resolve() != Path.cwd().resolve() or not deploy.name.startswith("vercel-staging-deploy-"):
               raise SystemExit("invalid deploy directory")
@@ -1263,5 +1715,27 @@ jobs:
               raise SystemExit("::error::Refusing cleanup of an unexpected deploy path.")
           if deploy.exists():
               shutil.rmtree(deploy)
+          PYTHON
+          )
+
+      - name: Clean staging artifact directory
+        if: always() && steps.transfer.outputs.incoming_dir != ''
+        env:
+          ARTIFACT_DIR: ${{ steps.transfer.outputs.incoming_dir }}
+          NEUTRAL_DIR: ${{ runner.temp }}
+          PYTHON_BIN: ${{ steps.tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$NEUTRAL_DIR"
+            PYTHONSAFEPATH=1 "$PYTHON_BIN" -I -S - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import shutil
+          incoming = Path(os.environ["ARTIFACT_DIR"])
+          if incoming.is_symlink() or incoming.parent.resolve() != Path.cwd().resolve() or not incoming.name.startswith("vercel-staging-incoming-"):
+              raise SystemExit("::error::Refusing cleanup of an unexpected artifact path.")
+          if incoming.exists():
+              shutil.rmtree(incoming)
           PYTHON
           )

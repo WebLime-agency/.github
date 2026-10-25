@@ -8,8 +8,8 @@ promotion regressions against --baseline 96ff8a89. Each case must first pass on
 the fixed workflow and then fail with its own assertion marker. Tests and
 mutations operate on temporary workflow copies;
 no checkout edits, service calls, credentials, or workflow dispatches occur.
-The TMPDIR case uses the reviewed 0c3b5128 harness with the fixed workflow as its
-baseline. An already-safe whitespace audit is verified as a pass, never credited
+The TMPDIR baseline pairs the reviewed 0c3b5128 harness with the compatible
+round-9 single-job workflow at 2e859c0d; the positive assertion uses C-prime. An already-safe whitespace audit is verified as a pass, never credited
 as a failing-baseline regression.
 """
 import argparse
@@ -45,10 +45,10 @@ BUILD = 'Build Vercel staging output'
 MUTATIONS = [
     ('P1-2 token argv', 'test_no_token_argv', lambda s: replace(s, 'run_vercel deploy --prebuilt)', 'run_vercel deploy --prebuilt --token="$control_token")')),
     ('P1-3 early bypass gate', 'test_early_bypass_gate', lambda s: replace(s, 'if [ "$BYPASS_CONFIGURED" != true ]; then', 'if false; then')),
-    ('P2-1 initial ancestry', 'test_dev_membership', lambda s: block(s, 'Verify exact source', lambda b: replace(b, 'if ! "$GIT_BIN" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then', 'if false; then'))),
+    ('P2-1 initial ancestry', 'test_dev_membership', lambda s: block(s, 'Verify dev ancestry', lambda b: replace(b, 'if ! "$GIT_BIN" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then', 'if false; then'))),
     ('P2-1 refreshed ancestry', 'test_dev_membership', lambda s: replace(s, 'if ! "$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then', 'if false; then')),
     ('P2-1 fresh dev tip', 'test_dev_membership', lambda s: replace(s, 'ORIGIN_DEV_SHA="$("$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" rev-parse refs/remotes/origin/dev)"', ': # regress to previously fetched ORIGIN_DEV_SHA')),
-    ('P2-1 initial fetch', 'test_private_fetch_credentials', lambda s: block(s, 'Verify exact source', lambda b: replace(b, '          fetch_dev\n', '          : # initial fetch removed\n'))),
+    ('P2-1 initial fetch', 'test_private_fetch_credentials', lambda s: block(s, 'Verify dev ancestry', lambda b: replace(b, '          fetch_dev\n', '          : # initial fetch removed\n'))),
     ('P2-1 promotion refetch', 'test_private_fetch_credentials', lambda s: block(s, CONTROL, lambda b: replace(b, '            fetch_dev\n          ); then', '            : # refresh removed\n          ); then'))),
     ('P2-1 private fetch credentials', 'test_private_fetch_credentials', lambda s: replace(s, 'READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0', 'GIT_TERMINAL_PROMPT=0', 2)),
     ('P2-2 empty smoke output', 'test_smoke_outcome_required', lambda s: replace(s, '[ "${SMOKE_RESULT:-}" = success ]', '[ -z "${SMOKE_RESULT:-}" ]')),
@@ -182,6 +182,52 @@ CASES = [(name, *CASE_IDS[name], mutate) for name, _, mutate in MUTATIONS] + [
     ('R9 canonical harness TMPDIR', 'tmpdir_suite', 'test_noncanonical_tmpdir_suite', lambda s: replace(s, 'TMP_ROOT=$(cd -- "$TMP_ROOT" && pwd -P)\n', '')),
 
 ]
+def job_block(text, job, transform):
+    match = re.search(r'^  ' + re.escape(job) + r':\n', text, re.M)
+    start = match.start()
+    next_job = re.search(r'^  [a-z][a-z-]*:\n', text[match.end():], re.M)
+    end = match.end() + next_job.start() if next_job else len(text)
+    return text[:start] + transform(text[start:end]) + text[end:]
+
+
+def graph_mutation(job, old, new):
+    return lambda text: job_block(text, job, lambda part: replace(part, old, new))
+
+
+GRAPH_MUTATIONS = {
+ 'graph_order': lambda s: s[:s.index('  preflight:\n')] + s[s.index('  build:\n'):s.index('  deploy-staging:\n')] + s[s.index('  preflight:\n'):s.index('  build:\n')] + s[s.index('  deploy-staging:\n'):],
+ 'preflight_runner': graph_mutation('preflight', 'weblime-staging-deploy]', 'wrong-label]'),
+ 'build_runner': graph_mutation('build', 'weblime-ci-build]', 'weblime-ci]'),
+ 'deploy_runner': graph_mutation('deploy-staging', 'weblime-staging-deploy]', 'wrong-label]'),
+ 'build_needs': graph_mutation('build', 'needs: preflight', 'needs: []'),
+ 'deploy_needs': graph_mutation('deploy-staging', 'needs: [preflight, build]', 'needs: [preflight]'),
+ 'build_environment': graph_mutation('build', '    needs:', '    environment: staging\n    needs:'),
+ 'preflight_environment': graph_mutation('preflight', '    runs-on:', '    environment: staging\n    runs-on:'),
+ 'staging_environment': graph_mutation('deploy-staging', 'environment: staging', 'environment: production'),
+ 'build_secrets': graph_mutation('build', '    needs:', '    env: {UNSAFE: "${{ secrets.UNSAFE }}"}\n    needs:'),
+ 'build_token': graph_mutation('build', '    needs:', '    env: {VERCEL_TOKEN: unsafe}\n    needs:'),
+ 'build_permissions': graph_mutation('build', 'contents: read', 'contents: write'),
+ 'build_variables': graph_mutation('build', 'VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}', 'VERCEL_ORG_ID: unsafe'),
+ 'upload_pin': lambda s: replace(s, 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02', 'actions/upload-artifact@v4'),
+ 'download_pin': lambda s: replace(s, 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093', 'actions/download-artifact@v4'),
+ 'retention': lambda s: replace(s, 'retention-days: 1', 'retention-days: 2'),
+ 'missing_artifact': lambda s: replace(s, 'if-no-files-found: error', 'if-no-files-found: warn'),
+ 'hidden_artifact': lambda s: replace(s, 'include-hidden-files: true', 'include-hidden-files: false'),
+ 'artifact_name': graph_mutation('build', 'name: staging-output-', 'name: wrong-output-'),
+ 'artifact_path': lambda s: replace(s, 'path: ${{ steps.artifact.outputs.artifact_dir }}', 'path: .'),
+ 'deploy_checkout': graph_mutation('deploy-staging', '    steps:', '    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'),
+ 'preflight_gate': graph_mutation('preflight', "BYPASS_CONFIGURED: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET != '' }}", 'BYPASS_CONFIGURED: true'),
+ 'preflight_ancestry': graph_mutation('preflight', 'merge-base --is-ancestor', 'merge-base --octopus'),
+ 'size_default': lambda s: replace(s, 'default: 40', 'default: 41'),
+ 'fresh_download': lambda s: replace(s, 'path: ${{ steps.transfer.outputs.incoming_dir }}', 'path: .'),
+ 'handoff': lambda s: replace(s, 'ORIGIN_DEV_SHA: ${{ needs.preflight.outputs.origin_dev_sha }}', 'ORIGIN_DEV_SHA: unsafe'),
+}
+CASES += [('C-prime ' + key, key, 'test_job_graph_case', mutate) for key, mutate in GRAPH_MUTATIONS.items()]
+for key, step_name in [('artifact_build_size','Validate staging artifact'), ('artifact_deploy_size','Prepare staging deploy context'), ('artifact_control_size',CONTROL), ('artifact_build_policy','Validate staging artifact'), ('artifact_deploy_policy','Prepare staging deploy context')]:
+    old, new = ('if total > max_bytes:', 'if False:') if key.endswith('size') else ('if path.name.lower() in forbidden:', 'if False:')
+    CASES.append(('C-prime ' + key, key, 'test_artifact_boundary_case', lambda s, name=step_name, a=old, b=new: block(s,name,lambda part: replace(part,a,b))))
+
+CASES.append(('C-prime size input', 'max_output_input', 'test_max_output_input', lambda s: replace(s, 'if [[ ! "$MAX_OUTPUT_MIB" =~ ^[1-9][0-9]*$ ]]; then', 'if false; then')))
 assert len({case_id for _, case_id, _, _ in CASES}) == len(CASES)
 
 
@@ -206,13 +252,13 @@ def main():
         baseline = subprocess.check_output(['git', 'show', args.baseline + ':.github/workflows/vercel-staging-reusable.yml'], cwd=ROOT, text=True)
     # Whitespace was already rejected by the historical parser. Verify that
     # positive baseline explicitly; never manufacture a failing-baseline claim.
-    baseline_already_safe = {'candidate_whitespace'}
+    baseline_already_safe = {'candidate_whitespace', 'staging_environment'}
     baseline_safe_count = 0
     with tempfile.TemporaryDirectory(prefix='vercel-staging-mutations-') as tmp:
         for number, (name, case_id, test, mutate) in enumerate(cases, 1):
             # A passing assertion on the fixed workflow is a prerequisite for
             # mutation evidence. No test that always fails can get credit.
-            env = os.environ | {'TEST_ONLY': test, 'REGRESSION_CASE': case_id, 'WORKFLOW_FILE': str(WORKFLOW)}
+            env = os.environ | {'TEST_ONLY': test, 'REGRESSION_CASE': case_id, 'JOB_GRAPH_CASE': case_id, 'ARTIFACT_CASE': case_id, 'WORKFLOW_FILE': str(WORKFLOW)}
             positive = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=180)
             if positive.returncode != 0:
                 raise SystemExit(f'FIXED-WORKFLOW PRECONDITION FAILED: {name}\n{positive.stdout}{positive.stderr}')
@@ -231,6 +277,10 @@ def main():
                 source = '\n'.join('ROOT_DIR=' + shlex.quote(str(ROOT)) if line.startswith('ROOT_DIR=') else line for line in source.splitlines()) + '\n'
                 path.write_text(source)
                 negative_env = env | {'STAGING_TMPDIR_HARNESS': str(path)}
+                if baseline is not None:
+                    historical = Path(tmp) / 'single-job.yml'
+                    historical.write_text(subprocess.check_output(['git', 'show', '2e859c0d:.github/workflows/vercel-staging-reusable.yml'], cwd=ROOT, text=True))
+                    negative_env['WORKFLOW_FILE'] = str(historical)
             else:
                 path.write_text(baseline if baseline is not None else mutate(current))
             result = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=negative_env, capture_output=True, text=True, timeout=180)
