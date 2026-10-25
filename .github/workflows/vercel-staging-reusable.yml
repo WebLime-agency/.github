@@ -36,6 +36,8 @@ name: Vercel Staging Deploy (reusable)
 #   permissive umask. Existing project.json files are refused, never overwritten.
 # - Keep the consumer repo's staging environment secret VERCEL_TOKEN dedicated
 #   to staging, team-scoped for WebLime Vercel, and distinct from production.
+# - Rollback is not compare-and-swap: an out-of-band alias change between
+#   capture and rollback can be overwritten by the captured target.
 # - Own rotation/revocation and the manual recovery runbook for post-promotion
 #   smoke failures. The per-repo alias allowlist below is the authorization
 #   boundary against production-alias selection.
@@ -876,6 +878,13 @@ jobs:
             exit 0
           fi
 
+          # Match the smoke policy before any readiness lookup or alias change.
+          if [[ ! "$deployment_url" =~ ^https://[a-z0-9-]+\.vercel\.app/?$ ]]; then
+            echo "::error::Invalid candidate deployment host"
+            set_result failed
+            exit 0
+          fi
+
           if ! verify_ready "$deployment_url"; then
             set_result "failed"
             exit 0
@@ -939,6 +948,25 @@ jobs:
               exit 0
             fi
           done
+
+          # Observe dev again after both alias changes. This is a fresh
+          # snapshot, not a lock on future pushes or out-of-band alias writers.
+          if ! (
+            cd "$TMPDIR/dev-check.git"
+            fetch_dev
+          ) || ! POST_PROMOTION_DEV_SHA="$("$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" rev-parse refs/remotes/origin/dev)"; then
+            echo "::error::Unable to verify origin/dev after promotion; attempting rollback."
+            rollback_aliases || true
+            exit 0
+          fi
+          if [ "$POST_PROMOTION_DEV_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::notice::origin/dev moved during promotion; restoring captured aliases."
+            if rollback_aliases; then
+              promoted_aliases=()
+              set_result superseded
+            fi
+            exit 0
+          fi
 
           set_result "success"
 

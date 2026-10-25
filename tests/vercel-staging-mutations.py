@@ -3,11 +3,15 @@
 
 Run normally to prove each mutation is caught. --baseline REV proves each new
 regression test fails on that revision's workflow (defaults to the reviewed
-593a0440 head). Tests and mutations operate on temporary workflow copies;
+593a0440 head). Use --case CASE_ID to select individual assertions, e.g. new
+promotion regressions against --baseline 96ff8a89. Each case must first pass on
+the fixed workflow and then fail with its own assertion marker. Tests and
+mutations operate on temporary workflow copies;
 no checkout edits, service calls, credentials, or workflow dispatches occur.
 """
 import argparse
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -41,7 +45,7 @@ MUTATIONS = [
     ('P2-1 refreshed ancestry', 'test_dev_membership', lambda s: replace(s, 'if ! "$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" merge-base --is-ancestor "$EXPECTED_SHA" "$ORIGIN_DEV_SHA"; then', 'if false; then')),
     ('P2-1 fresh dev tip', 'test_dev_membership', lambda s: replace(s, 'ORIGIN_DEV_SHA="$("$GIT_BIN" --git-dir="$TMPDIR/dev-check.git" rev-parse refs/remotes/origin/dev)"', ': # regress to previously fetched ORIGIN_DEV_SHA')),
     ('P2-1 initial fetch', 'test_private_fetch_credentials', lambda s: block(s, 'Verify exact source', lambda b: replace(b, '          fetch_dev\n', '          : # initial fetch removed\n'))),
-    ('P2-1 promotion refetch', 'test_private_fetch_credentials', lambda s: block(s, CONTROL, lambda b: replace(b, '            fetch_dev\n', '            : # refresh removed\n'))),
+    ('P2-1 promotion refetch', 'test_private_fetch_credentials', lambda s: block(s, CONTROL, lambda b: replace(b, '            fetch_dev\n          ); then', '            : # refresh removed\n          ); then'))),
     ('P2-1 private fetch credentials', 'test_private_fetch_credentials', lambda s: replace(s, 'READ_TOKEN="$read_token" GIT_TERMINAL_PROMPT=0', 'GIT_TERMINAL_PROMPT=0', 2)),
     ('P2-2 empty smoke output', 'test_smoke_outcome_required', lambda s: replace(s, '[ "${SMOKE_RESULT:-}" = success ]', '[ -z "${SMOKE_RESULT:-}" ]')),
     ('P2-2 smoke outcome', 'test_smoke_outcome_required', lambda s: replace(s, '[ "${SMOKE_OUTCOME:-}" = success ]', 'true')),
@@ -100,29 +104,110 @@ def move_hash(s):
     return s[:target] + part + s[target:]
 
 
+def move_candidate_check(s):
+    start = s.index('          # Match the smoke policy')
+    end = s.index('          if ! verify_ready "$deployment_url";', start)
+    check = s[start:end]
+    s = s[:start] + s[end:]
+    target = s.index('          # Observe dev again after both alias changes.')
+    return s[:target] + check + s[target:]
+
+
+def post_promotion(s, transform):
+    start = s.index('          # Observe dev again after both alias changes.')
+    end = s.index('          set_result "success"\n\n          CONTROL', start)
+    return s[:start] + transform(s[start:end]) + s[end:]
+
+
+# Dedicated cases prevent an earlier assertion in an aggregate test from
+# receiving credit for an unrelated mutation, including in raw-baseline mode.
+CASE_IDS = {
+    'P1-2 token argv': ('token_argv', 'test_no_token_argv'),
+    'P1-3 early bypass gate': ('early_bypass', 'test_early_bypass_gate'),
+    'P2-1 initial ancestry': ('initial_ancestry', 'test_regression_case'),
+    'P2-1 refreshed ancestry': ('refreshed_ancestry', 'test_regression_case'),
+    'P2-1 fresh dev tip': ('fresh_dev_tip', 'test_regression_case'),
+    'P2-1 initial fetch': ('initial_fetch', 'test_regression_case'),
+    'P2-1 promotion refetch': ('promotion_refetch', 'test_regression_case'),
+    'P2-1 private fetch credentials': ('private_credentials', 'test_regression_case'),
+    'P2-2 empty smoke output': ('empty_smoke', 'test_regression_case'),
+    'P2-2 smoke outcome': ('smoke_outcome', 'test_regression_case'),
+    'P2-3 candidate host': ('smoke_candidate', 'test_candidate_host_boundary'),
+    'P2-4 explicit anchor': ('explicit_anchor', 'test_regression_case'),
+    'P2-4 ambiguous anchor': ('ambiguous_anchor', 'test_regression_case'),
+    'P2-5 allowlist order': ('allowlist_order', 'test_regression_case'),
+    'P2-5 input order': ('input_order', 'test_regression_case'),
+    'P2-5 checkout pin': ('checkout_pin', 'test_regression_case'),
+    'P2-5 setup-node pin': ('setup_node_pin', 'test_regression_case'),
+    'P2-5 build HOME': ('build_home', 'test_regression_case'),
+    'P2-5 smoke HOME': ('smoke_home', 'test_regression_case'),
+    'P2-5 build TMPDIR': ('build_tmp', 'test_regression_case'),
+    'P2-5 smoke TMPDIR': ('smoke_tmp', 'test_regression_case'),
+    'P1-1 defense control HOME': ('control_home', 'test_regression_case'),
+    'P1-1 defense control TMPDIR': ('control_tmp', 'test_regression_case'),
+    'P1-1 defense privileged shell': ('privileged_shell', 'test_regression_case'),
+    'P1-1 defense control PATH': ('control_path', 'test_regression_case'),
+    'P1-1 defense smoke PATH': ('smoke_path', 'test_regression_case'),
+    'P2-5 settings validation order': ('settings_order', 'test_regression_case'),
+    'P2-5 early settings validation': ('early_settings', 'test_regression_case'),
+    'P2-5 early SHA validation': ('early_sha', 'test_regression_case'),
+    'P1-1 defense group verification': ('group_verify', 'test_build_cleanup_failure'),
+    'P3 hash before execution': ('hash_first', 'test_regression_case'),
+    'P3 node path traversal': ('node_path', 'test_regression_case'),
+    'P3 rollback cleanup': ('rollback_cleanup', 'test_regression_case'),
+    'P1-1 defense control inherited check': ('control_inherited', 'test_regression_case'),
+    'P1-1 defense smoke inherited check': ('smoke_inherited', 'test_regression_case'),
+    'P1-1 defense control scrub': ('control_scrub', 'test_regression_case'),
+    'P1-1 defense smoke scrub': ('smoke_scrub', 'test_regression_case'),
+    'P1-1 defense build scrub': ('build_scrub', 'test_regression_case'),
+    'P1-1 defense build session': ('build_session', 'test_regression_case'),
+    'P1-1 defense group kill': ('group_kill', 'test_regression_case'),
+}
+CASES = [(name, *CASE_IDS[name], mutate) for name, _, mutate in MUTATIONS] + [
+    ('R8 candidate authority before aliases', 'control_candidate', 'test_control_candidate_authority', move_candidate_check),
+    ('R8 post-promotion dev check', 'post_promotion_tip', 'test_post_promotion_dev_move', lambda s: post_promotion(s, lambda _: '')),
+    ('R8 rollback must verify', 'post_rollback_failure', 'test_post_promotion_rollback_failure', lambda s: replace(s, 'if rollback_aliases; then', 'if rollback_aliases || true; then')),
+    ('R8 post-fetch failure rolls back', 'post_fetch_failure', 'test_post_promotion_fetch_failure', lambda s: post_promotion(s, lambda b: replace(b, 'rollback_aliases || true', 'set_result failed'))),
+]
+assert len({case_id for _, case_id, _, _ in CASES}) == len(CASES)
+
+
+def verify_failure(status, output, case_id):
+    if status != 1:
+        return False
+    invalid = ('syntax error', 'command not found', 'unbound variable', 'could not extract workflow step')
+    if any(marker in output for marker in invalid):
+        return False
+    return re.search(r'^(?:not ok - |AssertionError: )REGRESSION:' + re.escape(case_id) + r'(?: |$)', output, re.MULTILINE) is not None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', nargs='?', const='593a04403693e408248870c6c5c284ea243581b9')
+    parser.add_argument('--case', dest='case_ids', action='append', choices=[case_id for _, case_id, _, _ in CASES])
     args = parser.parse_args()
+    cases = [case for case in CASES if not args.case_ids or case[1] in args.case_ids]
     current = WORKFLOW.read_text()
-    cases = MUTATIONS
+    baseline = None
     if args.baseline:
         baseline = subprocess.check_output(['git', 'show', args.baseline + ':.github/workflows/vercel-staging-reusable.yml'], cwd=ROOT, text=True)
-        cases = [(name, test, lambda _, text=baseline: text) for name, test, _ in MUTATIONS]
     with tempfile.TemporaryDirectory(prefix='vercel-staging-mutations-') as tmp:
-        for number, (name, test, mutate) in enumerate(cases, 1):
+        for number, (name, case_id, test, mutate) in enumerate(cases, 1):
+            # A passing assertion on the fixed workflow is a prerequisite for
+            # mutation evidence. No test that always fails can get credit.
+            env = os.environ | {'TEST_ONLY': test, 'REGRESSION_CASE': case_id, 'WORKFLOW_FILE': str(WORKFLOW)}
+            positive = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            if positive.returncode != 0:
+                raise SystemExit(f'FIXED-WORKFLOW PRECONDITION FAILED: {name}\n{positive.stdout}{positive.stderr}')
             path = Path(tmp) / f'{number}.yml'
-            path.write_text(mutate(current))
-            result = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=os.environ | {'WORKFLOW_FILE': str(path), 'TEST_ONLY': test}, capture_output=True, text=True, timeout=60)
-            if result.returncode == 0 or result.returncode == 77:
-                raise SystemExit(f'NOT CAUGHT: {name}\n{result.stdout}{result.stderr}')
-            # Syntax errors or a broken harness cannot count as regression evidence.
+            path.write_text(baseline if baseline is not None else mutate(current))
+            result = subprocess.run(['bash', str(HARNESS)], cwd=ROOT, env=env | {'WORKFLOW_FILE': str(path)}, capture_output=True, text=True, timeout=60)
             output = result.stdout + result.stderr
-            if any(marker in output for marker in ('syntax error', 'command not found', 'unbound variable', 'could not extract workflow step')):
-                raise SystemExit(f'INVALID MUTATION FAILURE: {name}\n{output}')
-            evidence = output.strip().splitlines()[-1]
+            if not verify_failure(result.returncode, output, case_id):
+                raise SystemExit(f'NO CASE-SPECIFIC EVIDENCE: {name} (exit {result.returncode})\n{output}')
+            evidence = next(line for line in output.splitlines() if line.startswith(('not ok - REGRESSION:', 'AssertionError: REGRESSION:')))
             print(f'caught {number}/{len(cases)} - {name}: {evidence}', flush=True)
-    print(f'All {len(cases)} {"baseline regressions reproduced" if args.baseline else "mutations caught"}.')
+    print(f'All {len(cases)} {"baseline regressions reproduced" if args.baseline else "mutations caught"} with case-specific evidence.')
 
 
 if __name__ == '__main__':

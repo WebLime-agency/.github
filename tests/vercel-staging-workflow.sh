@@ -141,7 +141,7 @@ extract_steps() {
   /usr/bin/python3 - "$STEPS_DIR" <<'FIXTURES'
 from pathlib import Path
 import sys
-keys = 'FIXTURE_FETCH_LOG ARGV_LOG NODE_LOG VERCEL_LOG VERCEL_STATE_DIR VERCEL_MODE FAIL_SECOND_ALIAS ROLLBACK_FAIL CONFIG_MARKER BUILD_DAEMON_PID CURL_LOG CURL_ARGV_LOG CURL_SCENARIO EXPECTED_BYPASS_SECRET LOGIN_URL STUB_CANDIDATE_URL FIXTURE_NOT_ANCESTOR FIXTURE_DEV_MOVED FIXTURE_GIT_ORIGIN_DEV_SHA'.split()
+keys = 'FIXTURE_DEPLOY_URL FIXTURE_POST_MOVE FIXTURE_POST_FETCH_FAIL FIXTURE_PLAIN_ANCHOR BUILD_SESSION_LOG FIXTURE_FETCH_LOG ARGV_LOG NODE_LOG VERCEL_LOG VERCEL_STATE_DIR VERCEL_MODE FAIL_SECOND_ALIAS ROLLBACK_FAIL CONFIG_MARKER BUILD_DAEMON_PID CURL_LOG CURL_ARGV_LOG CURL_SCENARIO EXPECTED_BYPASS_SECRET LOGIN_URL STUB_CANDIDATE_URL FIXTURE_NOT_ANCESTOR FIXTURE_DEV_MOVED FIXTURE_GIT_ORIGIN_DEV_SHA'.split()
 for name in ('control-plane.sh','smoke.sh','build.sh'):
     p=Path(sys.argv[1])/name
     s=p.read_text().replace('/usr/bin/env -i \\\n', '/usr/bin/env -i \\\n' + ''.join('  '+k+'="${'+k+':-}" \\\n' for k in keys))
@@ -171,6 +171,9 @@ materialize_production_alias_prepare() {
 
 install_stubs() {
   mkdir -p "$STUB_DIR"
+  # The extensionless synthetic CLI is CommonJS. An unrelated /tmp/package.json
+  # must not change how Node loads it between validation runs.
+  printf '%s\n' '{"type":"commonjs"}' > "$TMP_ROOT/package.json"
 
   cat > "$STUB_DIR/stat" <<'STUB'
 #!/usr/bin/env bash
@@ -258,6 +261,14 @@ case "$1" in
   init) exit 0 ;;
   merge-base) [ "${FIXTURE_NOT_ANCESTOR:-0}" != 1 ]; exit $? ;;
   fetch)
+    if [ -n "${FIXTURE_POST_MOVE:-}" ]; then
+      if [ -f "$VERCEL_STATE_DIR/dev-tip" ]; then
+        [ "${FIXTURE_POST_FETCH_FAIL:-0}" != 1 ] || exit 34
+        cp "$VERCEL_STATE_DIR/dev-tip" "$VERCEL_STATE_DIR/fetched-dev-tip"
+      else
+        echo 1111111111111111111111111111111111111111 > "$VERCEL_STATE_DIR/fetched-dev-tip"
+      fi
+    fi
     if [ -n "${FIXTURE_FETCH_LOG:-}" ]; then
       [ "${READ_TOKEN:-}" = synthetic-read-token ] || exit 31
       [ "$credential_reset" = yes ] && [ "$credential_helper" = yes ] || exit 32
@@ -272,7 +283,9 @@ case "$1" in
         echo "${FIXTURE_GIT_HEAD_SHA:-1111111111111111111111111111111111111111}"
         ;;
       refs/remotes/origin/dev)
-        if [ "${FIXTURE_DEV_MOVED:-0}" = 1 ]; then
+        if [ -n "${FIXTURE_POST_MOVE:-}" ] && [ -f "$VERCEL_STATE_DIR/fetched-dev-tip" ]; then
+          cat "$VERCEL_STATE_DIR/fetched-dev-tip"
+        elif [ "${FIXTURE_DEV_MOVED:-0}" = 1 ]; then
           echo 2222222222222222222222222222222222222222
         else
           echo "${FIXTURE_GIT_ORIGIN_DEV_SHA:-1111111111111111111111111111111111111111}"
@@ -467,6 +480,10 @@ switch (command) {
     fs.mkdirSync(path.join('.vercel', 'output'), { recursive: true });
     fs.writeFileSync(path.join('.vercel', 'output', 'config.json'), JSON.stringify({ version: 3, fixture: 'fresh-' + process.env.EXPECTED_SHA }) + '\n');
     log('build');
+    if (process.env.BUILD_SESSION_LOG) {
+      const pgid=require('child_process').execFileSync('/usr/bin/ps',['-o','pgid=','-p',String(process.pid)],{encoding:'utf8'}).trim();
+      fs.writeFileSync(process.env.BUILD_SESSION_LOG,String(process.pid)+' '+pgid+'\n');
+    }
     if (process.env.BUILD_DAEMON_PID) {
       const child=require('child_process').spawn('/bin/sleep',['300'],{stdio:'ignore'});
       fs.writeFileSync(process.env.BUILD_DAEMON_PID,String(child.pid)+'\n');
@@ -494,7 +511,7 @@ switch (command) {
     if (mode === 'deploy_malformed') {
       process.stdout.write('no deployment url here\n');
     } else {
-      process.stdout.write('https://candidate.vercel.app\n');
+      process.stdout.write((process.env.FIXTURE_DEPLOY_URL || 'https://candidate.vercel.app') + '\n');
     }
     break;
   }
@@ -509,8 +526,8 @@ switch (command) {
       process.stdout.write('not json\n');
       break;
     }
-    if (target === 'https://candidate.vercel.app') {
-      process.stdout.write(JSON.stringify({ readyState: 'READY', url: 'candidate.vercel.app' }) + '\n');
+    if (target === (process.env.FIXTURE_DEPLOY_URL || 'https://candidate.vercel.app')) {
+      process.stdout.write(JSON.stringify({ readyState: 'READY', url: target.slice('https://'.length) }) + '\n');
       break;
     }
     if (target === 'https://pythonlife.org' || target === 'https://staging.lm.fm') {
@@ -520,7 +537,7 @@ switch (command) {
         fs.writeFileSync(file, 'https://old-' + alias + '.vercel.app\n');
       }
       const current = fs.readFileSync(file, 'utf8').split('\n')[0];
-      process.stdout.write(JSON.stringify((mode === 'alias_only' ? {alias:'moving.vercel.app'} : mode === 'ambiguous_anchor' ? {url:current, deployment:{url:'different.vercel.app'}} : {alias:'moving.vercel.app', readyState:'READY', url:current})) + '\n');
+      process.stdout.write(JSON.stringify((mode === 'alias_only' ? {alias:'moving.vercel.app'} : mode === 'ambiguous_anchor' ? {url:current, deployment:{url:'different.vercel.app'}} : {...(process.env.FIXTURE_PLAIN_ANCHOR ? {} : {alias:'moving.vercel.app'}), readyState:'READY', url:current})) + '\n');
       break;
     }
     process.stdout.write(JSON.stringify({ readyState: 'READY', target }) + '\n');
@@ -545,6 +562,11 @@ switch (command) {
       process.exit(45);
     }
     fs.writeFileSync(aliasFile(alias), target + '\n');
+    if (target === 'https://candidate.vercel.app' &&
+        ((process.env.FIXTURE_POST_MOVE === 'first' && alias === 'pythonlife.org') ||
+         (process.env.FIXTURE_POST_MOVE === 'second' && alias === 'staging.lm.fm'))) {
+      fs.writeFileSync(path.join(stateDir,'dev-tip'), '2222222222222222222222222222222222222222\n');
+    }
     break;
   }
   default:
@@ -1596,7 +1618,7 @@ test_build_cleanup_failure() {
     read -r pid < "$BUILD_DAEMON_PID"
     kill "$pid" 2>/dev/null || true
   fi
-  [ "$status" != 0 ] || fail "surviving group must fail the build"
+  [ "$status" != 0 ] || fail "REGRESSION:group_verify surviving group must fail the build"
   [ ! -s "$GITHUB_OUTPUT" ] || fail "cleanup failure emitted a successful build receipt"
   assert_file_contains "$out" 'Build process group survived cleanup'
   pass "P1-1 defense cleanup verification fails before build handoff"
@@ -1632,7 +1654,7 @@ test_private_fetch_credentials() {
   : > "$FIXTURE_FETCH_LOG"
   run_script "$STEPS_DIR/verify-source.sh" "$out" || fail "private initial fetch"
   run_control_script "$out" || fail "private refresh fetch"
-  [ "$(grep -Fc 'authenticated-fetch' "$FIXTURE_FETCH_LOG")" = 2 ] || fail "both fetches must use explicit read credentials"
+  [ "$(grep -Fc 'authenticated-fetch' "$FIXTURE_FETCH_LOG")" = 3 ] || fail "source and both control fetches must use explicit read credentials"
   assert_file_not_contains "$out" synthetic-read-token
   assert_file_not_contains "$VERCEL_LOG" synthetic-read-token
   pass "P2-1 both fetches use ephemeral read credential helper"
@@ -1648,7 +1670,7 @@ test_no_token_argv() {
 import json,sys
 rows=[json.loads(x) for x in open(sys.argv[1])]
 assert rows and any(r['token']=='synthetic-secret-token' for r in rows)
-assert all('synthetic-secret-token' not in ' '.join(r['argv']) for r in rows), 'token in argv'
+assert all('synthetic-secret-token' not in ' '.join(r['argv']) for r in rows), 'REGRESSION:token_argv token in argv'
 PYTHON
   pass "P1-2 CLI receives token only in environment"
 }
@@ -1668,7 +1690,7 @@ test_early_bypass_gate() {
   if run_script "$TMP_ROOT/first.sh" "$out" BYPASS_CONFIGURED=false NODE_VERSION_FILE=.node-version EXPECTED_VERCEL_CLI_VERSION=56.3.1; then
     run_control_script "$out"
   fi
-  assert_file_contains "$out" "VERCEL_AUTOMATION_BYPASS_SECRET not configured"
+  grep -Fq "VERCEL_AUTOMATION_BYPASS_SECRET not configured" "$out" || fail "REGRESSION:early_bypass missing early secret guard"
   [ ! -s "$VERCEL_LOG" ] || fail "missing bypass invoked control plane"
   pass "P1-3 missing bypass stops first step before deploy/alias"
 }
@@ -1710,7 +1732,7 @@ test_candidate_host_boundary() {
   for url in 'https://a.b.vercel.app' 'https://a_vercel.vercel.app' 'https://candidate.vercel.app/path' 'https://candidate.vercel.app:443' 'https://candidate.vercel.app@elsewhere.example' 'https://elsewhere.example' 'http://candidate.vercel.app'; do
     set_smoke_env
     run_script "$STEPS_DIR/smoke.sh" "$out" DEPLOYMENT_URL="$url" VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || true
-    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "unsafe candidate accepted: $url"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] || fail "REGRESSION:smoke_candidate unsafe candidate accepted: $url"
     [ ! -s "$CURL_ARGV_LOG" ] || fail "unsafe candidate sent bypass/request: $url"
   done
   pass "P2-3 candidate authority rejects unsafe hosts before requests"
@@ -1786,6 +1808,256 @@ test_rollback_files_cleaned() {
   pass "P3 rollback files cleaned"
 }
 
+
+test_control_candidate_authority() {
+  local out="$TMP_ROOT/control-host.out"
+  set_control_env
+  run_control_script "$out" FIXTURE_DEPLOY_URL=https://a.b.vercel.app FIXTURE_PLAIN_ANCHOR=1 || fail "control host fixture startup"
+  if ! { [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] && ! grep -Fq 'alias set ' "$VERCEL_LOG" && ! grep -Fq 'inspect https://a.b.vercel.app' "$VERCEL_LOG"; }; then
+    fail "REGRESSION:control_candidate invalid host reached readiness/promotion"
+  fi
+  assert_file_contains "$out" 'Invalid candidate deployment host'
+  pass "control rejects strict-invalid candidate before readiness or alias mutation"
+}
+
+test_post_promotion_dev_move() {
+  local out="$TMP_ROOT/post-move.out" phase
+  for phase in first second; do
+    set_control_env
+    run_control_script "$out" FIXTURE_POST_MOVE="$phase" FIXTURE_PLAIN_ANCHOR=1 || fail "post-promotion fixture startup"
+    [ "$(read_output "$GITHUB_OUTPUT" result)" = superseded ] || fail "REGRESSION:post_promotion_tip stale promotion was not rolled back as superseded"
+    [ "$(read_output "$GITHUB_OUTPUT" promoted_aliases)" = '' ] || fail "restored aliases must not be reported as promoted"
+    assert_file_contains "$VERCEL_LOG" 'alias set https://candidate.vercel.app staging.lm.fm'
+    assert_file_contains "$VERCEL_LOG" 'alias set https://old-pythonlife.org.vercel.app pythonlife.org'
+    assert_file_contains "$VERCEL_LOG" 'alias set https://old-staging.lm.fm.vercel.app staging.lm.fm'
+    [ "$(cat "$VERCEL_STATE_DIR/pythonlife_org.target")" = https://old-pythonlife.org.vercel.app ] || fail "first alias not restored"
+    [ "$(cat "$VERCEL_STATE_DIR/staging_lm_fm.target")" = https://old-staging.lm.fm.vercel.app ] || fail "second alias not restored"
+  done
+  pass "dev moving during either alias promotion restores both aliases and requests restart"
+}
+
+test_post_promotion_rollback_failure() {
+  local out="$TMP_ROOT/post-rollback-fail.out"
+  set_control_env
+  run_control_script "$out" FIXTURE_POST_MOVE=second FIXTURE_PLAIN_ANCHOR=1 ROLLBACK_FAIL=1 || fail "post-promotion rollback failure fixture startup"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = rollback_failed ] || fail "REGRESSION:post_rollback_failure unverified rollback reported restart"
+  pass "post-promotion movement fails closed on unverifiable rollback"
+}
+
+test_post_promotion_fetch_failure() {
+  local out="$TMP_ROOT/post-fetch-fail.out"
+  set_control_env
+  run_control_script "$out" FIXTURE_POST_MOVE=second FIXTURE_PLAIN_ANCHOR=1 FIXTURE_POST_FETCH_FAIL=1 || fail "post-promotion fetch fixture startup"
+  [ "$(read_output "$GITHUB_OUTPUT" result)" = rolled_back ] || fail "REGRESSION:post_fetch_failure failed freshness check did not roll back"
+  assert_file_contains "$VERCEL_LOG" 'alias set https://old-pythonlife.org.vercel.app pythonlife.org'
+  assert_file_contains "$VERCEL_LOG" 'alias set https://old-staging.lm.fm.vercel.app staging.lm.fm'
+  pass "post-promotion fetch failure rolls back and reports failure"
+}
+
+test_mutation_marker_enforcement() {
+  /usr/bin/python3 - "$ROOT_DIR/tests/vercel-staging-mutations.py" <<'PYTHON'
+import runpy,sys
+namespace=runpy.run_path(sys.argv[1])
+check=namespace.get('verify_failure')
+assert callable(check), 'REGRESSION:mutation_markers case-specific evidence validator missing'
+for status,text in [(1,'not ok - unrelated assertion'),(1,'not ok - REGRESSION:other wrong case'),(77,'not ok - REGRESSION:chosen skipped'),(0,'not ok - REGRESSION:chosen success'),(1,'syntax error\nnot ok - REGRESSION:chosen malformed')]:
+    assert not check(status,text,'chosen'), 'REGRESSION:mutation_markers unrelated/invalid failure credited'
+assert check(1,'not ok - REGRESSION:chosen expected behavior absent','chosen')
+PYTHON
+  pass "mutation evidence rejects unrelated failures, skips and syntax failures"
+}
+
+# Each mutation invokes one independent assertion. Fixture setup failures never
+# carry a REGRESSION marker and therefore cannot be credited by the runner.
+test_regression_case() {
+  local regression_case=${REGRESSION_CASE:?}
+  local out="$TMP_ROOT/regression.out" status=0
+  case "$regression_case" in
+    allowlist_order|input_order|checkout_pin|setup_node_pin|settings_order|privileged_shell)
+      /usr/bin/python3 - "$WORKFLOW_FILE" "$regression_case" <<'PYTHON'
+import re,sys,yaml
+steps=yaml.safe_load(open(sys.argv[1]))['jobs']['deploy-staging']['steps']
+case=sys.argv[2]
+def index(name):
+    return next((i for i,s in enumerate(steps) if s['name']==name),len(steps))
+def step(name):
+    return next((s for s in steps if s['name']==name),{})
+checks={
+ 'allowlist_order': index('Prepare staging aliases') < index('Build Vercel staging output'),
+ 'input_order': index('Validate staging inputs')==0,
+ 'settings_order': index('Validate reviewed project settings') < index('Build Vercel staging output'),
+ 'checkout_pin': bool(re.fullmatch(r'actions/checkout@[0-9a-f]{40}',step('Checkout exact staging source').get('uses',''))),
+ 'setup_node_pin': bool(re.fullmatch(r'actions/setup-node@[0-9a-f]{40}',step('Setup Node.js').get('uses',''))),
+ 'privileged_shell': step('Vercel control-plane deploy/promote').get('shell')=='/bin/bash --noprofile --norc -p -e -o pipefail {0}',
+}
+assert checks[case], f'REGRESSION:{case} required property absent'
+PYTHON
+      ;;
+    early_settings|early_sha|node_path)
+      local name='Validate staging inputs'
+      [ "$regression_case" != early_settings ] || name='Validate reviewed project settings'
+      if ! grep -Fq "      - name: $name" "$WORKFLOW_FILE"; then
+        fail "REGRESSION:$regression_case no dedicated early validator"
+      fi
+      extract_step "$name" "$TMP_ROOT/validator.sh"
+      if [ "$regression_case" = early_settings ]; then
+        run_script "$TMP_ROOT/validator.sh" "$out" PYTHON_BIN=/usr/bin/python3 PROJECT_SETTINGS_JSON='{"env":"synthetic"}' || status=$?
+      elif [ "$regression_case" = early_sha ]; then
+        run_script "$TMP_ROOT/validator.sh" "$out" BYPASS_CONFIGURED=true EXPECTED_SHA=not-a-sha NODE_VERSION_FILE=.node-version || status=$?
+      else
+        run_script "$TMP_ROOT/validator.sh" "$out" BYPASS_CONFIGURED=true EXPECTED_SHA=1111111111111111111111111111111111111111 NODE_VERSION_FILE=../version || status=$?
+      fi
+      [ "$status" = 1 ] || fail "REGRESSION:$regression_case invalid value accepted"
+      ;;
+    initial_ancestry)
+      set_control_env
+      run_script "$STEPS_DIR/verify-source.sh" "$out" FIXTURE_NOT_ANCESTOR=1 || status=$?
+      if ! { [ "$status" = 1 ] && grep -Fq 'not an ancestor' "$out"; }; then
+        fail "REGRESSION:initial_ancestry non-dev SHA accepted before build"
+      fi
+      ;;
+    refreshed_ancestry|fresh_dev_tip)
+      set_control_env
+      local fault=FIXTURE_NOT_ANCESTOR=1 expected=failed
+      if [ "$regression_case" = fresh_dev_tip ]; then fault=FIXTURE_DEV_MOVED=1; expected=superseded; fi
+      run_control_script "$out" "$fault" FIXTURE_PLAIN_ANCHOR=1 || fail "control membership fixture startup"
+      if ! { [ "$(read_output "$GITHUB_OUTPUT" result)" = "$expected" ] && ! grep -Fq 'alias set ' "$VERCEL_LOG"; }; then
+        fail "REGRESSION:$regression_case stale/non-dev candidate reached aliases"
+      fi
+      ;;
+    initial_fetch|promotion_refetch|private_credentials)
+      set_control_env
+      export FIXTURE_FETCH_LOG="$TMP_ROOT/focused-fetch.log"
+      : > "$FIXTURE_FETCH_LOG"
+      if [ "$regression_case" != promotion_refetch ]; then
+        run_script "$STEPS_DIR/verify-source.sh" "$out" || status=$?
+        if ! { [ "$status" = 0 ] && [ "$(grep -c authenticated-fetch "$FIXTURE_FETCH_LOG" || true)" = 1 ]; }; then
+          fail "REGRESSION:$regression_case initial authenticated fetch absent"
+        fi
+      fi
+      if [ "$regression_case" != initial_fetch ]; then
+        : > "$FIXTURE_FETCH_LOG"
+        run_control_script "$out" FIXTURE_PLAIN_ANCHOR=1 || status=$?
+        # Both pre- and post-promotion fetches must run in control. Missing
+        # either cannot be hidden by the other or by the initial source fetch.
+        if ! { [ "$status" = 0 ] && [ "$(grep -c authenticated-fetch "$FIXTURE_FETCH_LOG" || true)" = 2 ]; }; then
+          fail "REGRESSION:$regression_case authenticated control fetch absent"
+        fi
+      fi
+      ;;
+    empty_smoke|smoke_outcome)
+      export GITHUB_OUTPUT="$TMP_ROOT/focused-finalize-output"
+      : > "$GITHUB_OUTPUT"
+      local smoke_result='' outcome=success
+      if [ "$regression_case" = smoke_outcome ]; then smoke_result=success; outcome=failure; fi
+      run_script "$STEPS_DIR/finalize.sh" "$out" CONTROL_RESULT=success SMOKE_RESULT="$smoke_result" SMOKE_OUTCOME="$outcome" || status=$?
+      if ! { [ "$status" = 1 ] && [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ]; }; then
+        fail "REGRESSION:$regression_case missing/failed smoke accepted"
+      fi
+      ;;
+    explicit_anchor|ambiguous_anchor)
+      set_control_env
+      local mode=alias_only
+      [ "$regression_case" != ambiguous_anchor ] || mode=ambiguous_anchor
+      run_control_script "$out" VERCEL_MODE="$mode" || fail "anchor fixture startup"
+      if ! { [ "$(read_output "$GITHUB_OUTPUT" result)" = failed ] && ! grep -Fq 'alias set ' "$VERCEL_LOG"; }; then
+        fail "REGRESSION:$regression_case unsupported rollback anchor accepted"
+      fi
+      ;;
+    control_home|control_tmp|control_path|control_scrub|build_home|build_tmp|build_scrub)
+      set_control_env
+      export ARGV_LOG="$TMP_ROOT/focused-env.log"
+      : > "$ARGV_LOG"
+      if [[ "$regression_case" == build_* ]]; then
+        unset VERCEL_TOKEN
+        rm -rf "$CONTROL_WORKDIR/.vercel"
+        ( cd "$CONTROL_WORKDIR"; run_script "$STEPS_DIR/build.sh" "$out" HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" UNREVIEWED_SENTINEL=poison ) || fail "build env fixture startup"
+      else
+        run_control_script "$out" FIXTURE_PLAIN_ANCHOR=1 HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" UNREVIEWED_SENTINEL=poison || fail "control env fixture startup"
+      fi
+      /usr/bin/python3 - "$ARGV_LOG" "$TMP_ROOT" "$NEUTRAL_DIR" "$regression_case" <<'PYTHON'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1])]
+assert rows, 'fixture did not invoke CLI'
+case=sys.argv[4]
+field=case.rsplit('_',1)[1]
+for r in rows:
+    okay={'home':r['home'] not in (sys.argv[2],sys.argv[3]),'tmp':bool(r['tmp']) and r['tmp']!=sys.argv[2],
+          'path':r['path']=='/usr/bin:/bin','scrub':r['sentinel']==''}[field]
+    assert okay, f'REGRESSION:{case} inherited CLI environment'
+PYTHON
+      ;;
+    smoke_home|smoke_tmp|smoke_path|smoke_scrub)
+      set_smoke_env
+      run_script "$STEPS_DIR/smoke.sh" "$out" HOME="$TMP_ROOT" TMPDIR="$TMP_ROOT" UNREVIEWED_SENTINEL=poison VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || fail "smoke env fixture startup"
+      /usr/bin/python3 - "$CURL_LOG" "$TMP_ROOT" "$regression_case" <<'PYTHON'
+import sys
+rows=[dict(x.split('=',1) for x in line.split()) for line in open(sys.argv[1]) if line.startswith('home=')]
+assert len(rows)==3, 'fixture did not invoke all curl requests'
+case=sys.argv[3]
+field=case.rsplit('_',1)[1]
+for r in rows:
+    okay={'home':r['home']!=sys.argv[2],'tmp':bool(r['tmp']) and r['tmp']!=sys.argv[2],
+          'path':r['path']=='/usr/bin:/bin','scrub':r['sentinel']==''}[field]
+    assert okay, f'REGRESSION:{case} inherited curl environment'
+PYTHON
+      ;;
+    control_inherited|smoke_inherited)
+      if [ "$regression_case" = control_inherited ]; then
+        set_control_env
+        run_control_script "$out" BASH_ENV= FIXTURE_PLAIN_ANCHOR=1 || status=$?
+        [ ! -s "$VERCEL_LOG" ] || status=0
+      else
+        set_smoke_env
+        run_script "$STEPS_DIR/smoke.sh" "$out" BASH_ENV= VERCEL_AUTOMATION_BYPASS_SECRET=synthetic-bypass-value EXPECTED_BYPASS_SECRET=synthetic-bypass-value || status=$?
+        [ ! -s "$CURL_ARGV_LOG" ] || status=0
+      fi
+      if ! { [ "$status" = 1 ] && grep -Fq 'Unsafe inherited environment' "$out"; }; then
+        fail "REGRESSION:$regression_case inherited startup injection accepted"
+      fi
+      ;;
+    build_session)
+      set_control_env
+      unset VERCEL_TOKEN
+      rm -rf "$CONTROL_WORKDIR/.vercel"
+      export BUILD_SESSION_LOG="$TMP_ROOT/build-session.log"
+      ( cd "$CONTROL_WORKDIR"; run_script "$STEPS_DIR/build.sh" "$out" ) || fail "build session fixture startup"
+      local pid pgid
+      read -r pid pgid < "$BUILD_SESSION_LOG"
+      [ "$pid" = "$pgid" ] || fail "REGRESSION:build_session CLI did not start its own process group"
+      ;;
+    group_kill)
+      set_control_env
+      unset VERCEL_TOKEN
+      rm -rf "$CONTROL_WORKDIR/.vercel"
+      export BUILD_DAEMON_PID="$TMP_ROOT/focused-daemon.pid"
+      ( cd "$CONTROL_WORKDIR"; run_script "$STEPS_DIR/build.sh" "$out" ) || status=$?
+      [ -s "$BUILD_DAEMON_PID" ] || fail "daemon fixture did not start"
+      local pid live=false
+      read -r pid < "$BUILD_DAEMON_PID"
+      if kill -0 "$pid" 2>/dev/null; then live=true; kill "$pid" 2>/dev/null || true; fi
+      if ! { [ "$status" = 0 ] && [ "$live" = false ]; }; then
+        fail "REGRESSION:group_kill build group was not cleaned successfully"
+      fi
+      ;;
+    hash_first)
+      common_preflight_env
+      materialize_preflight "$TMP_ROOT/focused-preflight.sh"
+      run_script "$TMP_ROOT/focused-preflight.sh" "$out" SHA_MODE=mismatch || status=$?
+      if ! { [ "$status" = 1 ] && [ ! -s "$NODE_LOG" ]; }; then
+        fail "REGRESSION:hash_first CLI ran before its hash was verified"
+      fi
+      ;;
+    rollback_cleanup)
+      set_control_env
+      run_control_script "$out" FAIL_SECOND_ALIAS=1 FIXTURE_PLAIN_ANCHOR=1 || fail "rollback cleanup fixture startup"
+      [ -z "$(find "$NEUTRAL_DIR" -name 'vercel-staging-rollback-*' -type f -print)" ] || fail "REGRESSION:rollback_cleanup rollback files remain"
+      ;;
+    *) fail "unknown independent regression case: $regression_case" ;;
+  esac
+  pass "independent regression: $regression_case"
+}
+
 unset BUILD_DAEMON_PID
 unset GIT_CEILING_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
 unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONSTARTUP NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NODE_TLS_REJECT_UNAUTHORIZED
@@ -1795,6 +2067,11 @@ if [ -n "${TEST_ONLY:-}" ]; then
   "$TEST_ONLY"
   exit
 fi
+test_control_candidate_authority
+test_post_promotion_dev_move
+test_post_promotion_rollback_failure
+test_post_promotion_fetch_failure
+test_mutation_marker_enforcement
 test_build_cleanup_failure
 test_fresh_homes
 test_private_fetch_credentials
