@@ -163,7 +163,7 @@ The shared config auto-labels from branch prefixes — `fix/`, `bug/`, `hotfix/`
 
 ### `release.json`
 
-Each release carries a `release.json` asset holding **only** the four customer-facing categories. Downstream consumers read that, not the prose body, so internal and security lines cannot leak through a consumer bug. The guarantee is structural rather than a convention.
+Each release carries a `release.json` asset holding **only** the four customer-facing categories. Downstream consumers read that, not the prose body, so `release/security` and `release/internal` lines never appear through the consumer path. That projection is a positive-label filter: the workflow adds a PR to a category whenever the matching customer-facing label is present, so the protection depends on the exactly-one-label contract above actually holding. A PR carrying both `release/security` and `release/fixed` would land in `fixed` — enforce the contract (one `release/*` label per PR) rather than assuming it.
 
 ---
 
@@ -205,7 +205,7 @@ Config was fetched from 2 different contexts.
 Found label for branch: 'release/internal'
 ```
 
-**The release workflow** uses `workflow_dispatch`, which only fires from the default branch. Add a temporary `push` trigger scoped to a scratch branch.
+**The release workflow** uses `workflow_dispatch`. A `workflow_dispatch` caller must first exist on the default branch for GitHub to register it, but a registered caller can then be dispatched against another branch (`gh workflow run <workflow> --ref <branch>`), so you do not always need a second trigger. When the caller itself is new and not yet on the default branch, add a temporary `push` trigger scoped to a scratch branch.
 
 In both cases, use a scratch branch off the PR branch rather than the PR branch itself, so the pull request under review is never touched and its reviews survive.
 
