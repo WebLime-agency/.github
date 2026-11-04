@@ -171,7 +171,7 @@ Each release carries a `release.json` asset holding **only** the four customer-f
 
 | Mode | Effect |
 | --- | --- |
-| `dry-run` | Renders the notes and `release.json` into the job summary. No tag or release is created. Caveat: a preflight failure opens no issue, but a failure *after* the toolchain preflight has resolved `gh` still runs the `Report failure` step, which can open an alert issue (`release-automation` when that label exists). So "write nothing" holds for releases, not unconditionally for issues. |
+| `dry-run` | Renders the notes and `release.json` into the job summary. No tag or release is created. As an operational exception, a later failure after the toolchain preflight has verified `gh` can cause `Report failure` to open an alert issue (`release-automation` when that label exists). A preflight failure opens no issue. Tracked as a defect to close once the workflow and this contract agree: WebLime-agency/.github#30. |
 | `draft` | Creates the tag and an unpublished release. |
 | `publish` | Creates the tag and a published release, with `release.json` attached. |
 
@@ -221,7 +221,7 @@ Each of these cost real time. None is caught by any test in this repo, because t
 
 **The autolabeler is a sub-action.** `release-drafter/release-drafter/autolabeler@…`, not the root action. From v7 the root action is the *drafter* and has no `disable-releaser` input, so pointing at it drafts a release on every pull request and applies no labels.
 
-**Pin commit SHAs, never `@main`.** A merge here would otherwise be live in every consumer immediately, with no review in the repo it affects. This repo has no PR CI, so such a merge is also machine-unverified. Bump pins in their own PR, linking the upstream change.
+**Pin commit SHAs, never `@main`.** A merge here would otherwise be live in every consumer immediately, with no review in the repo it affects. The `ci` job in this repo lints and tests the workflows, but it cannot prove how a *consumer* behaves, so such a merge is still unverified where it lands. Bump pins in their own PR, linking the upstream change.
 
 **`actions: read` is required.** The gate lists deploy workflow run conclusions. Without it every run dies with HTTP 403 before it can tell a pending deploy from a successful one.
 
