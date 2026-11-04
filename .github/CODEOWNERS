@@ -1,0 +1,4 @@
+# Org-wide reusable workflows and composite actions run with caller secrets in every WebLime repo.
+/.github/workflows/  @eba8
+/.github/actions/    @eba8
+/.github/CODEOWNERS  @eba8
