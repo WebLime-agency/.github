@@ -26,7 +26,7 @@ CI. Totals are printed and added to the job summary, so skips remain visible.
 | Workflow | Purpose |
 | --- | --- |
 | `release-anchored-reusable.yml` | Production-anchored GitHub Releases — **[docs](docs/release-anchored.md)** |
-| `claude-review-reusable.yml` | Claude PR review |
+| `claude-review-reusable.yml` | Explicit PR comment review requests - [contract](docs/claude-review.md) |
 | `claude-mention-reusable.yml` | `@claude` mention handling |
 | `codex-review-reusable.yml` | `@codex review` handling |
 | `vercel-production-reusable.yml` | Vercel production deploy |
